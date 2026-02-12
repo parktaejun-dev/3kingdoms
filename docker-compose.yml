@@ -1,0 +1,105 @@
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - web
+      - api
+      - ai
+    ports:
+      - "80:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - portraits_data:/data/portraits:ro
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./services/web
+    environment:
+      - VITE_API_BASE=/api
+      - VITE_SOCKET_URL=/
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./services/api
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - GAME_DAY_SECONDS=3600
+      - DATABASE_URL=postgresql://redcliff:redcliff@postgres:5432/redcliff
+      - REDIS_URL=redis://redis:6379
+      - AI_URL=http://ai:8000
+      - BIOGRAPHY_QUEUE=biography
+      - PORTRAIT_QUEUE=${PORTRAIT_QUEUE:-portraits}
+      - PORTRAITS_DIR=/data/portraits
+      - SD_MODEL_KEY=${SD_MODEL_KEY:-sd_turbo}
+    depends_on:
+      - postgres
+      - redis
+      - ai
+    volumes:
+      - portraits_data:/data/portraits
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./services/worker
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://redcliff:redcliff@postgres:5432/redcliff
+      - REDIS_URL=redis://redis:6379
+      - AI_URL=http://ai:8000
+      - BIOGRAPHY_QUEUE=biography
+      - PORTRAIT_QUEUE=${PORTRAIT_QUEUE:-portraits}
+      - PORTRAITS_DIR=/data/portraits
+    depends_on:
+      - postgres
+      - redis
+      - ai
+    volumes:
+      - portraits_data:/data/portraits
+    restart: unless-stopped
+
+  telegram-bot:
+    build:
+      context: ./services/telegram-bot
+    environment:
+      - NODE_ENV=production
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - API_BASE_URL=http://api:3000
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  ai:
+    build:
+      context: ./services/ai
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-deepseek-chat}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.deepseek.com/v1}
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=redcliff
+      - POSTGRES_USER=redcliff
+      - POSTGRES_PASSWORD=redcliff
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  portraits_data:

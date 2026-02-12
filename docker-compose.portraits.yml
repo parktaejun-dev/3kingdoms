@@ -1,0 +1,35 @@
+services:
+  api:
+    environment:
+      - PORTRAIT_QUEUE=portraits
+      - SD_MODEL_KEY=v1_5
+      - SD_NEGATIVE=worst quality, low quality, lowres, blurry, jpeg artifacts, deformed, disfigured, mutated, bad anatomy, bad proportions, extra limbs, extra fingers, ugly, creepy, horror, gore, blood, text, watermark, logo, signature, frame, border, mask, symbolic face, abstract face, opera, face paint, heavy makeup, ui, interface, panel, stylized, illustration, concept art, game art, icon, poster, splash art, flat shading, perfect symmetry, doll face, plastic skin
+    volumes:
+      - portraits_data:/data/portraits
+
+  worker:
+    environment:
+      - PORTRAIT_QUEUE=portraits
+      - SDCLI_PATH=/opt/sdcpp/build/bin/sd-cli
+      # Quality-first: SD 1.5 (slower than sd_turbo, but significantly cleaner for portraits).
+      - SD_MODEL=/opt/sdcpp/models/v1-5-pruned-emaonly.safetensors
+      - SD_MODEL_KEY=v1_5
+      - SD_NEGATIVE=worst quality, low quality, lowres, blurry, jpeg artifacts, deformed, disfigured, mutated, bad anatomy, bad proportions, extra limbs, extra fingers, ugly, creepy, horror, gore, blood, text, watermark, logo, signature, frame, border, mask, symbolic face, abstract face, opera, face paint, heavy makeup, ui, interface, panel, stylized, illustration, concept art, game art, icon, poster, splash art, flat shading, perfect symmetry, doll face, plastic skin
+      - SD_CFG_SCALE=6.5
+      - SD_SAMPLING_METHOD=dpm++2m
+      - SD_SCHEDULER=karras
+      - SD_STEPS=32
+      - SD_THREADS=4
+      - PORTRAITS_DIR=/data/portraits
+    volumes:
+      - portraits_data:/data/portraits
+      # Server-only: mount stable-diffusion.cpp build + models from host.
+      # On the server, this path exists (installed manually). For local dev, don't use this compose file.
+      - /home/ubuntu/sdcpp:/opt/sdcpp:ro
+
+  nginx:
+    volumes:
+      - portraits_data:/data/portraits:ro
+
+volumes:
+  portraits_data:

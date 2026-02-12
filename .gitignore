@@ -1,0 +1,10 @@
+node_modules
+.env
+*.log
+postgres_data
+redis_data
+npm-cache/
+services/*/npm-cache/
+__pycache__/
+*.pyc
+*.key
