@@ -28,6 +28,12 @@ function uuid() {
   return `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
 }
 
+function isUuid(v) {
+  const s = String(v || '').trim();
+  // Accept RFC 4122 variants. We don't enforce v4 only.
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
+}
+
 function safeLocalStorageGet(key, fallback = '') {
   try {
     const v = localStorage.getItem(key);
@@ -269,7 +275,11 @@ function App() {
     return safeLocalStorageGet('uiMode', 'ui') || 'ui';
   });
 
-  const [playerId, setPlayerId] = React.useState(() => safeLocalStorageGet('playerId', ''));
+  // Older builds stored non-UUID ids (e.g. "player1"). Server now uses UUID keys, so migrate by clearing.
+  const [playerId, setPlayerId] = React.useState(() => {
+    const v = safeLocalStorageGet('playerId', '');
+    return isUuid(v) ? v : '';
+  });
   const [battleId, setBattleId] = React.useState(() => safeLocalStorageGet('battleId', ''));
   const [matchId, setMatchId] = React.useState(() => safeLocalStorageGet('matchId', ''));
   const [matchState, setMatchState] = React.useState(null);
@@ -308,7 +318,10 @@ function App() {
   const [chronicle, setChronicle] = React.useState(null);
   const [showEmployOverlay, setShowEmployOverlay] = React.useState(false);
   const [employCandidates, setEmployCandidates] = React.useState([]);
-  const [showOfficerPicker, setShowOfficerPicker] = React.useState(() => !safeLocalStorageGet('playerId', ''));
+  const [showOfficerPicker, setShowOfficerPicker] = React.useState(() => {
+    const v = safeLocalStorageGet('playerId', '');
+    return !isUuid(v);
+  });
   const [pickerQuery, setPickerQuery] = React.useState('');
   const [pickerItems, setPickerItems] = React.useState([]);
   const [pickerLoading, setPickerLoading] = React.useState(false);
