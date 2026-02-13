@@ -182,3 +182,19 @@ CREATE TABLE IF NOT EXISTS match_replays (
   PRIMARY KEY (match_id, round)
 );
 CREATE INDEX IF NOT EXISTS match_replays_match_idx ON match_replays (match_id);
+
+CREATE TABLE IF NOT EXISTS match_story_events (
+  match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  seat INT NOT NULL,
+  round INT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | resolved
+  event_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  choices JSONB NOT NULL DEFAULT '[]'::jsonb,
+  picked_choice_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  resolved_at TIMESTAMPTZ,
+  PRIMARY KEY (match_id, seat, round)
+);
+CREATE INDEX IF NOT EXISTS match_story_events_match_idx ON match_story_events (match_id);

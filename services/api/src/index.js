@@ -626,6 +626,24 @@ async function ensureMatchSchema() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS match_replays_match_idx ON match_replays (match_id)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS match_story_events (
+      match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      seat INT NOT NULL,
+      round INT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      event_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      choices JSONB NOT NULL DEFAULT '[]'::jsonb,
+      picked_choice_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      resolved_at TIMESTAMPTZ,
+      PRIMARY KEY (match_id, seat, round)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS match_story_events_match_idx ON match_story_events (match_id)`);
 }
 
 async function ensureWorldSchema() {
@@ -5726,6 +5744,146 @@ function generateShopSlots({ matchSeed, round, rollsUsed, count = 5 }) {
   return picks.map((p) => ({ unitId: p.unitId, name: p.name, cost: p.cost, tags: p.tags }));
 }
 
+const STORY_EVENT_DEFS = [
+  {
+    id: 'black_market',
+    title: '암시장 상인',
+    body: '낡은 천막 아래, 상인이 귓속말을 건넨다. "오늘은 운이 좋군."',
+    weight: 1.2,
+    choices: [
+      { id: 'skip', label: '지나친다', effects: {} },
+      { id: 'reroll_discount', label: '정보를 산다 (G -2, 이번 라운드 리롤 -1)', effects: { gold: -2, reroll_cost_delta: -1 } },
+      { id: 'gold_cache', label: '숨은 금고 (G +4)', effects: { gold: 4 } }
+    ]
+  },
+  {
+    id: 'recruit_notice',
+    title: '등용 공고',
+    body: '관청 게시판에 등용 공고가 붙었다. 인재가 몰릴지도 모른다.',
+    weight: 1.0,
+    choices: [
+      { id: 'skip', label: '무시한다', effects: {} },
+      { id: 'shop_plus', label: '사람을 푼다 (G -2, 이번 라운드 상점 +1)', effects: { gold: -2, shop_slots_delta: 1 } },
+      { id: 'gold_small', label: '일당을 받는다 (G +2)', effects: { gold: 2 } }
+    ]
+  },
+  {
+    id: 'field_rumor',
+    title: '전장의 소문',
+    body: '병사들이 수군댄다. 상대의 약점이 보인다는 말도 있다.',
+    weight: 0.9,
+    choices: [
+      { id: 'skip', label: '듣지 않는다', effects: {} },
+      { id: 'gold_trade', label: '뇌물을 건넨다 (G -3, 이번 라운드 리롤 -1)', effects: { gold: -3, reroll_cost_delta: -1 } },
+      { id: 'gold_gain', label: '전리품을 챙긴다 (G +3)', effects: { gold: 3 } }
+    ]
+  }
+];
+
+function pickStoryEvent({ matchSeed, matchId, round, seat }) {
+  const rand = seededRng(rngHex8FromParts('story', matchSeed, matchId, round, seat));
+  const pool = STORY_EVENT_DEFS.map((e) => ({ ...e, weight: Number(e.weight || 1) }));
+  const picked = pickWeightedUnique(pool, 1, rand)[0] || STORY_EVENT_DEFS[0];
+  const choices = Array.isArray(picked.choices) ? picked.choices.slice(0, 3) : [{ id: 'skip', label: '지나친다', effects: {} }];
+  return { event_id: picked.id, title: picked.title, body: picked.body, choices };
+}
+
+function effectsForRound(effects, round) {
+  const e = effects && typeof effects === 'object' ? effects : {};
+  const r = asInt(e.round, 0);
+  if (r !== asInt(round, 0)) return { round: asInt(round, 0), reroll_cost_delta: 0, shop_slots_delta: 0 };
+  return {
+    round: r,
+    reroll_cost_delta: asInt(e.reroll_cost_delta, 0),
+    shop_slots_delta: asInt(e.shop_slots_delta, 0)
+  };
+}
+
+async function ensureStoryEventForSeat(client, { matchId, matchSeed, seat, round }) {
+  const r = await client.query(
+    `SELECT status FROM match_story_events WHERE match_id=$1 AND seat=$2 AND round=$3`,
+    [matchId, seat, round]
+  );
+  if (r.rows.length) return;
+  const ev = pickStoryEvent({ matchSeed, matchId, round, seat });
+  await client.query(
+    `INSERT INTO match_story_events (match_id, seat, round, status, event_id, title, body, choices)
+     VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7::jsonb)`,
+    [matchId, seat, round, ev.event_id, ev.title, ev.body, JSON.stringify(ev.choices)]
+  );
+}
+
+async function assertNoPendingStory(client, { matchId, seat, round }) {
+  const q = await client.query(
+    `SELECT status FROM match_story_events WHERE match_id=$1 AND seat=$2 AND round=$3 AND status='pending'`,
+    [matchId, seat, round]
+  );
+  if (q.rows.length) throw new Error('스토리 선택이 남아 있습니다. (먼저 story card 선택)');
+}
+
+async function applyStoryChoiceTx(client, { matchId, matchSeed, seat, round, choiceId, auto = false }) {
+  const evq = await client.query(
+    `SELECT status, event_id, title, body, choices
+     FROM match_story_events
+     WHERE match_id=$1 AND seat=$2 AND round=$3
+     FOR UPDATE`,
+    [matchId, seat, round]
+  );
+  if (!evq.rows.length) throw new Error('story event not found');
+  const ev = evq.rows[0];
+  if (String(ev.status || '') !== 'pending') return { ok: true, already: true };
+  const choices = Array.isArray(ev.choices) ? ev.choices : [];
+  const cid = String(choiceId || '').trim();
+  const hit = choices.find((c) => c && String(c.id || '').trim() === cid) || null;
+  if (!hit) throw new Error('invalid choice');
+  const eff = hit.effects && typeof hit.effects === 'object' ? hit.effects : {};
+
+  const pr = await client.query(`SELECT gold, effects FROM match_players WHERE match_id=$1 AND seat=$2 FOR UPDATE`, [matchId, seat]);
+  if (!pr.rows.length) throw new Error('match player not found');
+  const gold0 = asInt(pr.rows[0].gold, 0);
+  const goldDelta = asInt(eff.gold, 0);
+  if (goldDelta < 0 && gold0 < Math.abs(goldDelta)) {
+    if (auto) {
+      // Auto choice fallback: treat as skip if unaffordable.
+      return applyStoryChoiceTx(client, { matchId, matchSeed, seat, round, choiceId: 'skip', auto: true });
+    }
+    throw new Error('gold is not enough for this choice');
+  }
+
+  const prevEff = effectsForRound(pr.rows[0].effects, round);
+  const nextEff = {
+    round,
+    reroll_cost_delta: prevEff.reroll_cost_delta + asInt(eff.reroll_cost_delta, 0),
+    shop_slots_delta: prevEff.shop_slots_delta + asInt(eff.shop_slots_delta, 0)
+  };
+
+  if (goldDelta !== 0) {
+    await client.query(`UPDATE match_players SET gold=GREATEST(0, gold+$3), updated_at=now() WHERE match_id=$1 AND seat=$2`, [matchId, seat, goldDelta]);
+  }
+  await client.query(`UPDATE match_players SET effects=$3::jsonb, updated_at=now() WHERE match_id=$1 AND seat=$2`, [matchId, seat, JSON.stringify(nextEff)]);
+
+  // If shop slots change, regenerate the shop immediately for this round (and unlock).
+  if (asInt(eff.shop_slots_delta, 0) !== 0) {
+    const s0 = await client.query(`SELECT rolls_used FROM match_shops WHERE match_id=$1 AND seat=$2 FOR UPDATE`, [matchId, seat]);
+    const rollsUsed = asInt(s0.rows[0]?.rolls_used, 0);
+    const count = 5 + asInt(nextEff.shop_slots_delta, 0);
+    const slots = generateShopSlots({ matchSeed: matchSeed, round, rollsUsed, count });
+    await client.query(
+      `UPDATE match_shops SET locked=false, slots=$3::jsonb, updated_at=now() WHERE match_id=$1 AND seat=$2`,
+      [matchId, seat, JSON.stringify(slots)]
+    );
+  }
+
+  await client.query(
+    `UPDATE match_story_events
+     SET status='resolved', picked_choice_id=$4, resolved_at=now()
+     WHERE match_id=$1 AND seat=$2 AND round=$3`,
+    [matchId, seat, round, cid]
+  );
+
+  return { ok: true, choiceId: cid, effects: nextEff, goldDelta };
+}
+
 function unitStatsFromOfficerId(officerId) {
   const id = String(officerId || '').trim();
   const o = (seedOfficers || []).find((x) => x && x.id === id) || null;
@@ -5989,6 +6147,9 @@ app.post('/api/match/create', async (req, res) => {
         [matchId, round, JSON.stringify(slots2)]
       );
 
+      await ensureStoryEventForSeat(client, { matchId, matchSeed: seed, seat: 1, round });
+      await ensureStoryEventForSeat(client, { matchId, matchSeed: seed, seat: 2, round });
+
       return {
         matchId,
         mode,
@@ -6047,6 +6208,16 @@ app.get('/api/match/:matchId/state', async (req, res) => {
         [matchId]
       );
       const round = rq.rows[0] || null;
+      const curRound = round ? asInt(round.round, 1) : 1;
+
+      const eq = await client.query(
+        `SELECT seat, status, event_id, title, body, choices
+         FROM match_story_events
+         WHERE match_id=$1 AND round=$2 AND status='pending'`,
+        [matchId, curRound]
+      );
+      const myEv = eq.rows.find((r) => asInt(r.seat, 0) === asInt(meRow.seat, 0)) || null;
+      const oppEv = oppRow ? eq.rows.find((r) => asInt(r.seat, 0) === asInt(oppRow.seat, 0)) || null : null;
 
       return {
         match: {
@@ -6078,6 +6249,9 @@ app.get('/api/match/:matchId/state', async (req, res) => {
           board: meRow.board_state || {},
           bench: meRow.bench_state || {},
           effects: meRow.effects || {},
+          storyEvent: myEv
+            ? { eventId: myEv.event_id, title: myEv.title, body: myEv.body, choices: Array.isArray(myEv.choices) ? myEv.choices : [] }
+            : null,
           shop: myShop
             ? {
                 round: asInt(myShop.round, 1),
@@ -6099,6 +6273,7 @@ app.get('/api/match/:matchId/state', async (req, res) => {
               board: oppRow.board_state || {},
               bench: oppRow.bench_state || {},
               effects: oppRow.effects || {},
+              storyEvent: oppEv ? { eventId: oppEv.event_id, title: oppEv.title, body: oppEv.body } : null,
               shop: oppShop
                 ? {
                     round: asInt(oppShop.round, 1),
@@ -6161,12 +6336,13 @@ app.post('/api/match/:matchId/shop/reroll', async (req, res) => {
       if (phase !== 'prep') throw new Error(`cannot reroll during phase=${phase}`);
 
       const pr = await client.query(
-        `SELECT seat, gold FROM match_players WHERE match_id=$1 AND player_id=$2 FOR UPDATE`,
+        `SELECT seat, gold, effects FROM match_players WHERE match_id=$1 AND player_id=$2 FOR UPDATE`,
         [matchId, playerId]
       );
       if (!pr.rows.length) throw new Error('player is not in this match');
       const seat = asInt(pr.rows[0].seat, 1);
       const gold0 = asInt(pr.rows[0].gold, 0);
+      await assertNoPendingStory(client, { matchId, seat, round });
 
       const sr = await client.query(
         `SELECT round, locked, rolls_used FROM match_shops WHERE match_id=$1 AND seat=$2 FOR UPDATE`,
@@ -6175,10 +6351,12 @@ app.post('/api/match/:matchId/shop/reroll', async (req, res) => {
       if (!sr.rows.length) throw new Error('shop not initialized');
       if (Boolean(sr.rows[0].locked)) throw new Error('shop is locked');
 
-      const cost = 2;
+      const eff = effectsForRound(pr.rows[0].effects, round);
+      const cost = Math.max(0, 2 + asInt(eff.reroll_cost_delta, 0));
       if (gold0 < cost) throw new Error(`not enough gold (need ${cost})`);
       const rollsUsed = asInt(sr.rows[0].rolls_used, 0) + 1;
-      const slots = generateShopSlots({ matchSeed: seed, round, rollsUsed, count: 5 });
+      const count = 5 + asInt(eff.shop_slots_delta, 0);
+      const slots = generateShopSlots({ matchSeed: seed, round, rollsUsed, count });
 
       await client.query(`UPDATE match_players SET gold=gold-$3, updated_at=now() WHERE match_id=$1 AND seat=$2`, [
         matchId,
@@ -6214,6 +6392,9 @@ app.post('/api/match/:matchId/shop/lock', async (req, res) => {
       );
       if (!pr.rows.length) throw new Error('player is not in this match');
       const seat = asInt(pr.rows[0].seat, 1);
+      const rp = await client.query(`SELECT round, phase FROM match_rounds WHERE match_id=$1 ORDER BY round DESC LIMIT 1`, [matchId]);
+      const round = asInt(rp.rows[0]?.round, 1);
+      await assertNoPendingStory(client, { matchId, seat, round });
       await client.query(`UPDATE match_shops SET locked=$3, updated_at=now() WHERE match_id=$1 AND seat=$2`, [
         matchId,
         seat,
@@ -6255,6 +6436,7 @@ app.post('/api/match/:matchId/shop/buy', async (req, res) => {
       );
       if (!pr.rows.length) throw new Error('player is not in this match');
       const seat = asInt(pr.rows[0].seat, 1);
+      await assertNoPendingStory(client, { matchId, seat, round });
       const gold0 = asInt(pr.rows[0].gold, 0);
       const bench0 = normalizeBench(pr.rows[0].bench_state);
       if (bench0.units.length >= bench0.cap) throw new Error('bench is full');
@@ -6322,6 +6504,9 @@ app.post('/api/match/:matchId/board/place', async (req, res) => {
       );
       if (!pr.rows.length) throw new Error('player is not in this match');
       const seat = asInt(pr.rows[0].seat, 1);
+      const rp2 = await client.query(`SELECT round FROM match_rounds WHERE match_id=$1 ORDER BY round DESC LIMIT 1`, [matchId]);
+      const round2 = asInt(rp2.rows[0]?.round, 1);
+      await assertNoPendingStory(client, { matchId, seat, round: round2 });
       const board0 = normalizeBoard(pr.rows[0].board_state);
       const bench0 = normalizeBench(pr.rows[0].bench_state);
 
@@ -6372,6 +6557,9 @@ app.post('/api/match/:matchId/board/remove', async (req, res) => {
       );
       if (!pr.rows.length) throw new Error('player is not in this match');
       const seat = asInt(pr.rows[0].seat, 1);
+      const rp2 = await client.query(`SELECT round FROM match_rounds WHERE match_id=$1 ORDER BY round DESC LIMIT 1`, [matchId]);
+      const round2 = asInt(rp2.rows[0]?.round, 1);
+      await assertNoPendingStory(client, { matchId, seat, round: round2 });
       const board0 = normalizeBoard(pr.rows[0].board_state);
       const bench0 = normalizeBench(pr.rows[0].bench_state);
       if (bench0.units.length >= bench0.cap) throw new Error('bench is full');
@@ -6411,6 +6599,40 @@ app.get('/api/match/:matchId/replay/:round', async (req, res) => {
       if (!rr.rows.length) throw new Error('replay not found');
       const r = rr.rows[0];
       return { round, created_at: r.created_at, timeline: Array.isArray(r.timeline) ? r.timeline : [], summary: r.summary || {} };
+    });
+
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
+
+app.post('/api/match/:matchId/story/choice', async (req, res) => {
+  try {
+    const matchId = String(req.params?.matchId || '').trim();
+    const playerId = String(req.body?.playerId || '').trim();
+    const choiceId = String(req.body?.choiceId || '').trim();
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId is required' });
+    if (!playerId) return res.status(400).json({ ok: false, error: 'playerId is required' });
+    if (!choiceId) return res.status(400).json({ ok: false, error: 'choiceId is required' });
+
+    const out = await withTx(async (client) => {
+      const m = await client.query(`SELECT seed, status FROM matches WHERE id=$1 FOR UPDATE`, [matchId]);
+      if (!m.rows.length) throw new Error('match not found');
+      if (String(m.rows[0].status || '') !== 'ongoing') throw new Error('match is not ongoing');
+      const seed = String(m.rows[0].seed || '').trim();
+
+      const rr = await client.query(`SELECT round, phase FROM match_rounds WHERE match_id=$1 ORDER BY round DESC LIMIT 1`, [matchId]);
+      const round = asInt(rr.rows[0]?.round, 1);
+      const phase = String(rr.rows[0]?.phase || 'prep');
+      if (phase !== 'prep') throw new Error(`cannot choose during phase=${phase}`);
+
+      const pr = await client.query(`SELECT seat FROM match_players WHERE match_id=$1 AND player_id=$2 FOR UPDATE`, [matchId, playerId]);
+      if (!pr.rows.length) throw new Error('player is not in this match');
+      const seat = asInt(pr.rows[0].seat, 1);
+
+      const r = await applyStoryChoiceTx(client, { matchId, matchSeed: seed, seat, round, choiceId, auto: false });
+      return { seat, round, ...r };
     });
 
     res.json({ ok: true, ...out });
@@ -6475,6 +6697,22 @@ async function autobattlerTickOnce() {
       const resultSeconds = 8;
 
       if (phase === 'prep') {
+        // Ensure story events exist for this round.
+        await ensureStoryEventForSeat(client, { matchId, matchSeed: seed, seat: 1, round: roundNum });
+        await ensureStoryEventForSeat(client, { matchId, matchSeed: seed, seat: 2, round: roundNum });
+
+        // Auto-resolve any pending story to keep the match flowing (default: skip).
+        const pend = await client.query(
+          `SELECT seat, choices FROM match_story_events WHERE match_id=$1 AND round=$2 AND status='pending' FOR UPDATE`,
+          [matchId, roundNum]
+        );
+        for (const e of pend.rows) {
+          const choices = Array.isArray(e.choices) ? e.choices : [];
+          const hasSkip = choices.some((c) => c && String(c.id || '') === 'skip');
+          const pick = hasSkip ? 'skip' : String(choices[0]?.id || 'skip');
+          await applyStoryChoiceTx(client, { matchId, matchSeed: seed, seat: asInt(e.seat, 1), round: roundNum, choiceId: pick, auto: true });
+        }
+
         // Bot: make sure it has something to fight with.
         const sr = await client.query(`SELECT slots FROM match_shops WHERE match_id=$1 AND seat=2 FOR UPDATE`, [matchId]);
         const slots = Array.isArray(sr.rows[0]?.slots) ? sr.rows[0].slots : [];
@@ -6563,6 +6801,8 @@ async function autobattlerTickOnce() {
 
         if (!dead) {
           const nextRound = roundNum + 1;
+          // Reset per-round effects at the start of the new round.
+          await client.query(`UPDATE match_players SET effects='{}'::jsonb, updated_at=now() WHERE match_id=$1`, [matchId]);
           await client.query(
             `INSERT INTO match_rounds (match_id, round, phase, started_at, ends_at, resolved, result_json)
              VALUES ($1, $2, 'prep', now(), now()+interval '${prepSeconds} seconds', false, '{}'::jsonb)
@@ -6581,6 +6821,9 @@ async function autobattlerTickOnce() {
               [matchId, seat, nextRound, JSON.stringify(nextSlots)]
             );
           }
+
+          await ensureStoryEventForSeat(client, { matchId, matchSeed: seed, seat: 1, round: nextRound });
+          await ensureStoryEventForSeat(client, { matchId, matchSeed: seed, seat: 2, round: nextRound });
         }
 
         advanced += 1;

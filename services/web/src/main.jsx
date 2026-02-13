@@ -625,6 +625,16 @@ function App() {
     }
   }
 
+  async function matchStoryChoice(choiceId) {
+    const id = String(choiceId || '').trim();
+    if (!id) return;
+    setMatchBusy(true);
+    const r = await matchPost('/story/choice', { choiceId: id });
+    setMatchBusy(false);
+    pushSystem(r.ok ? `선택: ${id}` : `선택 실패: ${r.error}`);
+    await fetchMatchState();
+  }
+
   async function matchReroll() {
     setMatchBusy(true);
     const r = await matchPost('/shop/reroll', {});
@@ -2327,6 +2337,8 @@ function App() {
                     const left = endsAt ? Math.max(0, Math.ceil((endsAt - Date.now()) / 1000)) : null;
                     const my = ms.me || {};
                     const opp = ms.opponent || {};
+                    const storyEv = my.storyEvent || null;
+                    const storyPending = !!(storyEv && Array.isArray(storyEv.choices) && storyEv.choices.length);
                     const shop = my.shop || {};
                     const slots = Array.isArray(shop.slots) ? shop.slots : [];
 
@@ -2354,7 +2366,7 @@ function App() {
                               key: `cell-${x}-${y}`,
                               className: 'btn-soft',
                               style: { padding: '8px 6px', textAlign: 'center', minHeight: 34, opacity: matchBusy ? 0.7 : 1 },
-                              disabled: matchBusy,
+                              disabled: matchBusy || storyPending,
                               onClick: () => {
                                 if (u && u.instanceId) matchRemove(u.instanceId);
                                 else matchPlace(x, y);
@@ -2377,6 +2389,30 @@ function App() {
                     return React.createElement(
                       'div',
                       null,
+                      storyPending
+                        ? React.createElement(
+                            'div',
+                            { className: 'feed-item', style: { marginBottom: 10 } },
+                            React.createElement('div', { className: 'feed-text text-glow' }, storyEv.title || 'STORY'),
+                            React.createElement('div', { className: 'hint', style: { marginTop: 6, whiteSpace: 'pre-wrap' } }, storyEv.body || ''),
+                            React.createElement(
+                              'div',
+                              { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' } },
+                              (storyEv.choices || []).slice(0, 3).map((c) =>
+                                React.createElement(
+                                  'button',
+                                  {
+                                    key: `sev-${c.id}`,
+                                    className: 'retro-btn pill',
+                                    disabled: matchBusy || phase !== 'prep',
+                                    onClick: () => matchStoryChoice(c.id)
+                                  },
+                                  String(c.label || c.id || 'choice')
+                                )
+                              )
+                            )
+                          )
+                        : null,
                       React.createElement(
                         'div',
                         { className: 'hint', style: { marginBottom: 8 } },
@@ -2386,10 +2422,10 @@ function App() {
                       React.createElement(
                         'div',
                         { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 } },
-                        React.createElement('button', { className: 'retro-btn pill secondary', disabled: matchBusy || phase !== 'prep', onClick: () => matchReroll() }, 'REROLL (-2)'),
+                        React.createElement('button', { className: 'retro-btn pill secondary', disabled: matchBusy || phase !== 'prep' || storyPending, onClick: () => matchReroll() }, 'REROLL'),
                         React.createElement(
                           'button',
-                          { className: 'retro-btn pill secondary', disabled: matchBusy, onClick: () => matchLock(!shop.locked) },
+                          { className: 'retro-btn pill secondary', disabled: matchBusy || storyPending, onClick: () => matchLock(!shop.locked) },
                           shop.locked ? 'UNLOCK' : 'LOCK'
                         ),
                         React.createElement(
@@ -2408,7 +2444,7 @@ function App() {
                             {
                               key: `shop-${i}`,
                               className: 'btn-soft',
-                              disabled: matchBusy || phase !== 'prep' || empty,
+                              disabled: matchBusy || phase !== 'prep' || empty || storyPending,
                               onClick: () => matchBuy(i)
                             },
                             empty ? '—' : `${String(s.unitId).slice(0, 8)} · ${s.cost}G`
@@ -2429,7 +2465,7 @@ function App() {
                                   key: `bench-${id}`,
                                   className: 'btn-soft',
                                   style: { outline: active ? '2px solid rgba(54,243,177,0.65)' : 'none' },
-                                  disabled: matchBusy || !id || phase !== 'prep',
+                                  disabled: matchBusy || !id || phase !== 'prep' || storyPending,
                                   onClick: () => setMatchSelectedUnitId(active ? '' : id),
                                   title: id
                                 },
