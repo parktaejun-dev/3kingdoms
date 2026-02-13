@@ -599,6 +599,33 @@ async function ensureMatchSchema() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS match_rounds_match_idx ON match_rounds (match_id)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS match_shops (
+      match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      seat INT NOT NULL,
+      round INT NOT NULL,
+      locked BOOLEAN NOT NULL DEFAULT FALSE,
+      rolls_used INT NOT NULL DEFAULT 0,
+      slots JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (match_id, seat)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS match_shops_match_idx ON match_shops (match_id)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS match_replays (
+      match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      round INT NOT NULL,
+      timeline JSONB NOT NULL DEFAULT '[]'::jsonb,
+      summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (match_id, round)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS match_replays_match_idx ON match_replays (match_id)`);
 }
 
 async function ensureWorldSchema() {
@@ -5655,6 +5682,237 @@ function randomSeed64String() {
   return n.toString(10);
 }
 
+function rngHex8FromParts(...parts) {
+  return sha256Hex(parts.map((p) => String(p ?? '')).join('|')).slice(0, 8);
+}
+
+function getAutobattlerRoster() {
+  // Reuse playable officers as the MVP roster (exactly 12 in world190.js).
+  const roster = (seedOfficers || []).filter((o) => o && o.is_playable);
+  const costs = {
+    // Cost tiers (MVP): create basic shop pacing.
+    lu_bu: 3,
+    cao_cao: 3,
+    guan_yu: 2,
+    zhao_yun: 2,
+    yuan_shao: 2,
+    xun_yu: 2,
+    xiahou_dun: 2,
+    xiahou_yuan: 2,
+    liu_bei: 2,
+    sun_jian: 2,
+    zhang_fei: 1,
+    diaochan: 2
+  };
+  return roster.map((o) => ({
+    unitId: o.id,
+    name: o.name_kr,
+    cost: asInt(costs[o.id] ?? 1, 1),
+    tags: [String(o.force_id || '').trim(), 'officer'].filter(Boolean)
+  }));
+}
+
+function generateShopSlots({ matchSeed, round, rollsUsed, count = 5 }) {
+  const roster = getAutobattlerRoster();
+  const rand = seededRng(rngHex8FromParts('shop', matchSeed, round, rollsUsed));
+  const pool = roster.map((u) => {
+    // Early rounds bias toward cheaper units.
+    const r = Math.max(1, asInt(round, 1));
+    const base = u.cost === 1 ? 1.8 : u.cost === 2 ? 1.1 : 0.55;
+    const curve = r <= 3 ? 1.0 : r <= 6 ? 0.9 : 0.8;
+    return { ...u, weight: base * curve };
+  });
+  const picks = pickWeightedUnique(pool, Math.max(1, Math.min(9, asInt(count, 5))), rand);
+  return picks.map((p) => ({ unitId: p.unitId, name: p.name, cost: p.cost, tags: p.tags }));
+}
+
+function unitStatsFromOfficerId(officerId) {
+  const id = String(officerId || '').trim();
+  const o = (seedOfficers || []).find((x) => x && x.id === id) || null;
+  if (!o) {
+    return { unitId: id || 'unknown', name: id || 'unknown', cost: 1, tags: ['ronin', 'officer'], hp: 320, atk: 18, def: 4, aspd: 1.0, range: 1 };
+  }
+  const war = asInt(o.war, 50);
+  const ldr = asInt(o.ldr, 50);
+  const intl = asInt(o.int_stat, 50);
+  const pol = asInt(o.pol, 50);
+  const chr = asInt(o.chr, 50);
+  const roster = getAutobattlerRoster();
+  const base = roster.find((u) => u.unitId === id);
+  const cost = asInt(base?.cost ?? 1, 1);
+  const tags = Array.isArray(base?.tags) ? base.tags : [String(o.force_id || 'ronin'), 'officer'];
+  const hp = Math.floor(220 + war * 4.2 + ldr * 2.2);
+  const atk = Math.floor(10 + war * 0.65 + ldr * 0.10);
+  const def = Math.floor(3 + ldr * 0.08 + pol * 0.04);
+  const aspd = clamp(0.65 + chr / 220, 0.65, 1.65);
+  const range = intl >= 90 ? 3 : intl >= 75 ? 2 : 1;
+  return { unitId: id, name: o.name_kr, cost, tags, hp, atk, def, aspd, range };
+}
+
+function seatLocalToGlobalPos(seat, x, y) {
+  // Global battlefield is 7x8:
+  // - seat1 occupies y=0..3
+  // - seat2 occupies y=4..7, with local y=0 treated as "front" (closest to enemy)
+  const s = asInt(seat, 1);
+  const xx = asInt(x, 0);
+  const yy = asInt(y, 0);
+  if (s === 1) return { x: xx, y: yy };
+  return { x: xx, y: 4 + yy };
+}
+
+function simulateAutobattleRound({ matchId, matchSeed, round, p1, p2 }) {
+  // Deterministic sim for MVP: basic attack + move on 7x8 grid.
+  const rand = seededRng(rngHex8FromParts('fight', matchSeed, matchId, round));
+  const tickMs = 100;
+  const maxTicks = 650; // ~65s hard stop
+  const timeline = [];
+
+  function pushEvt(t, evt) {
+    timeline.push({ t, ...evt });
+  }
+
+  function mkTeam(player, seat) {
+    const board = normalizeBoard(player.board_state);
+    const units = (board.units || [])
+      .filter((u) => u && typeof u.x === 'number' && typeof u.y === 'number' && u.unitId)
+      .slice(0, 16)
+      .map((u, idx) => {
+        const base = unitStatsFromOfficerId(u.unitId);
+        const gx = clamp(asInt(u.x, 0), 0, 6);
+        const gyLocal = clamp(asInt(u.y, 0), 0, 3);
+        const g = seatLocalToGlobalPos(seat, gx, gyLocal);
+        const id = String(u.instanceId || `inst_${seat}_${idx}`).trim() || `inst_${seat}_${idx}`;
+        return {
+          id,
+          seat,
+          unitId: base.unitId,
+          name: base.name,
+          cost: base.cost,
+          tags: base.tags,
+          x: g.x,
+          y: g.y,
+          hp: base.hp,
+          hpMax: base.hp,
+          atk: base.atk,
+          def: base.def,
+          aspd: base.aspd,
+          range: base.range,
+          cd: 0
+        };
+      });
+    return units;
+  }
+
+  const units = mkTeam(p1, 1).concat(mkTeam(p2, 2));
+  const alive = () => units.filter((u) => u.hp > 0);
+  const teamAlive = (seat) => units.some((u) => u.hp > 0 && u.seat === seat);
+
+  function manhattan(a, b) {
+    return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+  }
+
+  function pickTarget(u) {
+    const enemies = units.filter((e) => e.hp > 0 && e.seat !== u.seat);
+    if (!enemies.length) return null;
+    enemies.sort((a, b) => manhattan(u, a) - manhattan(u, b) || a.hp - b.hp || (a.id < b.id ? -1 : 1));
+    return enemies[0];
+  }
+
+  function stepToward(u, t) {
+    const dx = t.x - u.x;
+    const dy = t.y - u.y;
+    const candidates = [];
+    if (Math.abs(dx) >= Math.abs(dy)) {
+      if (dx > 0) candidates.push({ x: u.x + 1, y: u.y });
+      if (dx < 0) candidates.push({ x: u.x - 1, y: u.y });
+      if (dy > 0) candidates.push({ x: u.x, y: u.y + 1 });
+      if (dy < 0) candidates.push({ x: u.x, y: u.y - 1 });
+    } else {
+      if (dy > 0) candidates.push({ x: u.x, y: u.y + 1 });
+      if (dy < 0) candidates.push({ x: u.x, y: u.y - 1 });
+      if (dx > 0) candidates.push({ x: u.x + 1, y: u.y });
+      if (dx < 0) candidates.push({ x: u.x - 1, y: u.y });
+    }
+    candidates.push({ x: u.x, y: u.y }); // fallback
+    for (const c of candidates) {
+      if (c.x < 0 || c.x > 6) continue;
+      if (c.y < 0 || c.y > 7) continue;
+      // Allow overlap for MVP (no collision); keeps sim simple.
+      return c;
+    }
+    return { x: u.x, y: u.y };
+  }
+
+  let winnerSeat = null;
+  for (let tick = 0; tick < maxTicks; tick += 1) {
+    const t = tick * tickMs;
+    if (!teamAlive(1) || !teamAlive(2)) break;
+
+    // Shuffle order deterministically to reduce bias.
+    const order = alive().slice().sort((a, b) => (a.id < b.id ? -1 : 1));
+    for (let i = order.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(rand() * (i + 1));
+      const tmp = order[i];
+      order[i] = order[j];
+      order[j] = tmp;
+    }
+
+    for (const u of order) {
+      if (u.hp <= 0) continue;
+      const target = pickTarget(u);
+      if (!target) continue;
+
+      u.cd = Math.max(0, u.cd - tickMs / 1000);
+      const dist = manhattan(u, target);
+      if (dist > u.range) {
+        const next = stepToward(u, target);
+        if (next.x !== u.x || next.y !== u.y) {
+          const from = { x: u.x, y: u.y };
+          u.x = next.x;
+          u.y = next.y;
+          pushEvt(t, { type: 'move', src: u.id, seat: u.seat, from, to: { x: u.x, y: u.y } });
+        }
+        continue;
+      }
+
+      if (u.cd > 0) continue;
+      const raw = Math.floor(u.atk + rand() * 6);
+      const dmg = Math.max(1, raw - Math.floor(target.def));
+      target.hp = Math.max(0, target.hp - dmg);
+      u.cd = 1 / Math.max(0.35, u.aspd);
+      pushEvt(t, { type: 'attack', src: u.id, dst: target.id, seat: u.seat, amount: dmg, dstHp: target.hp });
+      if (target.hp <= 0) pushEvt(t, { type: 'death', src: target.id, seat: target.seat });
+    }
+  }
+
+  const a1 = units.filter((u) => u.hp > 0 && u.seat === 1);
+  const a2 = units.filter((u) => u.hp > 0 && u.seat === 2);
+  if (a1.length && !a2.length) winnerSeat = 1;
+  else if (a2.length && !a1.length) winnerSeat = 2;
+  else {
+    // Timeout: compare remaining hp sum.
+    const s1 = a1.reduce((acc, u) => acc + u.hp, 0);
+    const s2 = a2.reduce((acc, u) => acc + u.hp, 0);
+    winnerSeat = s1 === s2 ? (rand() < 0.5 ? 1 : 2) : s1 > s2 ? 1 : 2;
+  }
+
+  function armyPower(list) {
+    return list.reduce((acc, u) => acc + Math.max(1, asInt(u.cost, 1)) * 2, 0);
+  }
+  const dmgToLoser = 5 + Math.floor(armyPower(winnerSeat === 1 ? a1 : a2) / 4);
+
+  const summary = {
+    winnerSeat,
+    dmgToLoser,
+    survivors: {
+      seat1: a1.map((u) => ({ unitId: u.unitId, hp: u.hp })),
+      seat2: a2.map((u) => ({ unitId: u.unitId, hp: u.hp }))
+    }
+  };
+
+  return { timeline, summary };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Auto-battler MVP (1v1, 7x4) endpoints (dev-grade: create + state)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5674,6 +5932,7 @@ app.post('/api/match/create', async (req, res) => {
       const seed = randomSeed64String();
       const idr = await client.query(`SELECT 'mat_' || substr(md5(random()::text),1,12) AS id`);
       const matchId = String(idr.rows[0].id);
+      const round = 1;
 
       // Seat2 is a bot for MVP; keep it simple but pick a playable officer.
       const bot = await client.query(
@@ -5699,12 +5958,12 @@ app.post('/api/match/create', async (req, res) => {
 
       await client.query(
         `INSERT INTO match_players (match_id, seat, player_id, officer_id, hp, gold, level, xp, board_state, bench_state, effects)
-         VALUES ($1, 1, $2, $3, 100, 0, 1, 0, $4::jsonb, $5::jsonb, $6::jsonb)`,
+         VALUES ($1, 1, $2, $3, 100, 5, 1, 0, $4::jsonb, $5::jsonb, $6::jsonb)`,
         [matchId, playerId, myOfficerId, JSON.stringify(board), JSON.stringify(bench), JSON.stringify(effects)]
       );
       await client.query(
         `INSERT INTO match_players (match_id, seat, player_id, officer_id, hp, gold, level, xp, board_state, bench_state, effects)
-         VALUES ($1, 2, NULL, $2, 100, 0, 1, 0, $3::jsonb, $4::jsonb, $5::jsonb)`,
+         VALUES ($1, 2, NULL, $2, 100, 5, 1, 0, $3::jsonb, $4::jsonb, $5::jsonb)`,
         [matchId, botOfficerId, JSON.stringify(board), JSON.stringify(bench), JSON.stringify(effects)]
       );
 
@@ -5715,12 +5974,27 @@ app.post('/api/match/create', async (req, res) => {
         [matchId]
       );
 
+      const slots1 = generateShopSlots({ matchSeed: seed, round, rollsUsed: 0, count: 5 });
+      await client.query(
+        `INSERT INTO match_shops (match_id, seat, round, locked, rolls_used, slots)
+         VALUES ($1, 1, $2, false, 0, $3::jsonb)
+         ON CONFLICT (match_id, seat) DO UPDATE SET round=$2, locked=false, rolls_used=0, slots=$3::jsonb, updated_at=now()`,
+        [matchId, round, JSON.stringify(slots1)]
+      );
+      const slots2 = generateShopSlots({ matchSeed: seed, round, rollsUsed: 0, count: 5 });
+      await client.query(
+        `INSERT INTO match_shops (match_id, seat, round, locked, rolls_used, slots)
+         VALUES ($1, 2, $2, false, 0, $3::jsonb)
+         ON CONFLICT (match_id, seat) DO UPDATE SET round=$2, locked=false, rolls_used=0, slots=$3::jsonb, updated_at=now()`,
+        [matchId, round, JSON.stringify(slots2)]
+      );
+
       return {
         matchId,
         mode,
         seed,
-        me: { seat: 1, playerId, officerId: myOfficerId, hp: 100, gold: 0, level: 1, xp: 0 },
-        opponent: { seat: 2, playerId: null, officerId: botOfficerId, name: botOfficerName, hp: 100, gold: 0, level: 1, xp: 0 }
+        me: { seat: 1, playerId, officerId: myOfficerId, hp: 100, gold: 5, level: 1, xp: 0 },
+        opponent: { seat: 2, playerId: null, officerId: botOfficerId, name: botOfficerName, hp: 100, gold: 5, level: 1, xp: 0 }
       };
     });
 
@@ -5754,6 +6028,15 @@ app.get('/api/match/:matchId/state', async (req, res) => {
       const meRow = pq.rows.find((r) => String(r.player_id || '') === playerId);
       if (!meRow) throw new Error('player is not in this match');
       const oppRow = pq.rows.find((r) => asInt(r.seat, 0) !== asInt(meRow.seat, 0)) || null;
+
+      const sq = await client.query(
+        `SELECT seat, round, locked, rolls_used, slots
+         FROM match_shops
+         WHERE match_id = $1`,
+        [matchId]
+      );
+      const myShop = sq.rows.find((r) => asInt(r.seat, 0) === asInt(meRow.seat, 0)) || null;
+      const oppShop = oppRow ? sq.rows.find((r) => asInt(r.seat, 0) === asInt(oppRow.seat, 0)) || null : null;
 
       const rq = await client.query(
         `SELECT round, phase, started_at, ends_at, resolved, result_json
@@ -5794,7 +6077,15 @@ app.get('/api/match/:matchId/state', async (req, res) => {
           xp: asInt(meRow.xp, 0),
           board: meRow.board_state || {},
           bench: meRow.bench_state || {},
-          effects: meRow.effects || {}
+          effects: meRow.effects || {},
+          shop: myShop
+            ? {
+                round: asInt(myShop.round, 1),
+                locked: Boolean(myShop.locked),
+                rollsUsed: asInt(myShop.rolls_used, 0),
+                slots: Array.isArray(myShop.slots) ? myShop.slots : []
+              }
+            : null
         },
         opponent: oppRow
           ? {
@@ -5807,7 +6098,15 @@ app.get('/api/match/:matchId/state', async (req, res) => {
               xp: asInt(oppRow.xp, 0),
               board: oppRow.board_state || {},
               bench: oppRow.bench_state || {},
-              effects: oppRow.effects || {}
+              effects: oppRow.effects || {},
+              shop: oppShop
+                ? {
+                    round: asInt(oppShop.round, 1),
+                    locked: Boolean(oppShop.locked),
+                    rollsUsed: asInt(oppShop.rolls_used, 0),
+                    slots: Array.isArray(oppShop.slots) ? oppShop.slots : []
+                  }
+                : null
             }
           : null
       };
@@ -5818,6 +6117,479 @@ app.get('/api/match/:matchId/state', async (req, res) => {
     res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
   }
 });
+
+function normalizeBench(bench) {
+  const b = bench && typeof bench === 'object' ? bench : {};
+  const cap = asInt(b.cap ?? 8, 8);
+  const units = Array.isArray(b.units) ? b.units : Array.isArray(b.slots) ? b.slots.filter(Boolean) : [];
+  return { cap: clamp(cap, 0, 99), units };
+}
+
+function normalizeBoard(board) {
+  const bb = board && typeof board === 'object' ? board : {};
+  const w = clamp(asInt(bb.w ?? 7, 7), 1, 16);
+  const h = clamp(asInt(bb.h ?? 4, 4), 1, 16);
+  const units = Array.isArray(bb.units) ? bb.units : [];
+  return { w, h, units };
+}
+
+function findUnitInList(list, instanceId) {
+  const id = String(instanceId || '').trim();
+  if (!id) return null;
+  return (list || []).find((u) => u && String(u.instanceId || '').trim() === id) || null;
+}
+
+app.post('/api/match/:matchId/shop/reroll', async (req, res) => {
+  try {
+    const matchId = String(req.params?.matchId || '').trim();
+    const playerId = String(req.body?.playerId || '').trim();
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId is required' });
+    if (!playerId) return res.status(400).json({ ok: false, error: 'playerId is required' });
+
+    const out = await withTx(async (client) => {
+      const mq = await client.query(`SELECT id, seed, status FROM matches WHERE id=$1 FOR UPDATE`, [matchId]);
+      if (!mq.rows.length) throw new Error('match not found');
+      if (String(mq.rows[0].status || '') !== 'ongoing') throw new Error('match is not ongoing');
+      const seed = String(mq.rows[0].seed || '').trim();
+
+      const rp = await client.query(
+        `SELECT round, phase FROM match_rounds WHERE match_id=$1 ORDER BY round DESC LIMIT 1`,
+        [matchId]
+      );
+      const round = asInt(rp.rows[0]?.round, 1);
+      const phase = String(rp.rows[0]?.phase || 'prep');
+      if (phase !== 'prep') throw new Error(`cannot reroll during phase=${phase}`);
+
+      const pr = await client.query(
+        `SELECT seat, gold FROM match_players WHERE match_id=$1 AND player_id=$2 FOR UPDATE`,
+        [matchId, playerId]
+      );
+      if (!pr.rows.length) throw new Error('player is not in this match');
+      const seat = asInt(pr.rows[0].seat, 1);
+      const gold0 = asInt(pr.rows[0].gold, 0);
+
+      const sr = await client.query(
+        `SELECT round, locked, rolls_used FROM match_shops WHERE match_id=$1 AND seat=$2 FOR UPDATE`,
+        [matchId, seat]
+      );
+      if (!sr.rows.length) throw new Error('shop not initialized');
+      if (Boolean(sr.rows[0].locked)) throw new Error('shop is locked');
+
+      const cost = 2;
+      if (gold0 < cost) throw new Error(`not enough gold (need ${cost})`);
+      const rollsUsed = asInt(sr.rows[0].rolls_used, 0) + 1;
+      const slots = generateShopSlots({ matchSeed: seed, round, rollsUsed, count: 5 });
+
+      await client.query(`UPDATE match_players SET gold=gold-$3, updated_at=now() WHERE match_id=$1 AND seat=$2`, [
+        matchId,
+        seat,
+        cost
+      ]);
+      await client.query(
+        `UPDATE match_shops SET round=$3, rolls_used=$4, slots=$5::jsonb, updated_at=now() WHERE match_id=$1 AND seat=$2`,
+        [matchId, seat, round, rollsUsed, JSON.stringify(slots)]
+      );
+
+      return { seat, goldCost: cost, rollsUsed, slots };
+    });
+
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
+
+app.post('/api/match/:matchId/shop/lock', async (req, res) => {
+  try {
+    const matchId = String(req.params?.matchId || '').trim();
+    const playerId = String(req.body?.playerId || '').trim();
+    const locked = Boolean(req.body?.locked);
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId is required' });
+    if (!playerId) return res.status(400).json({ ok: false, error: 'playerId is required' });
+
+    const out = await withTx(async (client) => {
+      const pr = await client.query(
+        `SELECT seat FROM match_players WHERE match_id=$1 AND player_id=$2 FOR UPDATE`,
+        [matchId, playerId]
+      );
+      if (!pr.rows.length) throw new Error('player is not in this match');
+      const seat = asInt(pr.rows[0].seat, 1);
+      await client.query(`UPDATE match_shops SET locked=$3, updated_at=now() WHERE match_id=$1 AND seat=$2`, [
+        matchId,
+        seat,
+        locked
+      ]);
+      return { seat, locked };
+    });
+
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
+
+app.post('/api/match/:matchId/shop/buy', async (req, res) => {
+  try {
+    const matchId = String(req.params?.matchId || '').trim();
+    const playerId = String(req.body?.playerId || '').trim();
+    const slotIndex = asInt(req.body?.slotIndex, -1);
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId is required' });
+    if (!playerId) return res.status(400).json({ ok: false, error: 'playerId is required' });
+    if (slotIndex < 0) return res.status(400).json({ ok: false, error: 'slotIndex is required' });
+
+    const out = await withTx(async (client) => {
+      const mq = await client.query(`SELECT seed, status FROM matches WHERE id=$1 FOR UPDATE`, [matchId]);
+      if (!mq.rows.length) throw new Error('match not found');
+      if (String(mq.rows[0].status || '') !== 'ongoing') throw new Error('match is not ongoing');
+
+      const rp = await client.query(
+        `SELECT round, phase FROM match_rounds WHERE match_id=$1 ORDER BY round DESC LIMIT 1`,
+        [matchId]
+      );
+      const phase = String(rp.rows[0]?.phase || 'prep');
+      if (phase !== 'prep') throw new Error(`cannot buy during phase=${phase}`);
+
+      const pr = await client.query(
+        `SELECT seat, gold, bench_state FROM match_players WHERE match_id=$1 AND player_id=$2 FOR UPDATE`,
+        [matchId, playerId]
+      );
+      if (!pr.rows.length) throw new Error('player is not in this match');
+      const seat = asInt(pr.rows[0].seat, 1);
+      const gold0 = asInt(pr.rows[0].gold, 0);
+      const bench0 = normalizeBench(pr.rows[0].bench_state);
+      if (bench0.units.length >= bench0.cap) throw new Error('bench is full');
+
+      const sr = await client.query(
+        `SELECT slots, rolls_used, round FROM match_shops WHERE match_id=$1 AND seat=$2 FOR UPDATE`,
+        [matchId, seat]
+      );
+      if (!sr.rows.length) throw new Error('shop not initialized');
+      const slots = Array.isArray(sr.rows[0].slots) ? sr.rows[0].slots.slice() : [];
+      if (slotIndex >= slots.length) throw new Error('invalid slotIndex');
+      const offer = slots[slotIndex];
+      if (!offer || !offer.unitId) throw new Error('empty slot');
+      const cost = asInt(offer.cost, 1);
+      if (gold0 < cost) throw new Error(`not enough gold (need ${cost})`);
+
+      const instanceId = `u_${sha256Hex(`${matchId}|${seat}|${Date.now()}|${Math.random()}`).slice(0, 10)}`;
+      const unit = { instanceId, unitId: String(offer.unitId), star: 1 };
+      const bench1 = { ...bench0, units: bench0.units.concat([unit]) };
+      slots[slotIndex] = null;
+
+      await client.query(
+        `UPDATE match_players
+         SET gold=gold-$3, bench_state=$4::jsonb, updated_at=now()
+         WHERE match_id=$1 AND seat=$2`,
+        [matchId, seat, cost, JSON.stringify(bench1)]
+      );
+      await client.query(
+        `UPDATE match_shops SET slots=$3::jsonb, updated_at=now() WHERE match_id=$1 AND seat=$2`,
+        [matchId, seat, JSON.stringify(slots)]
+      );
+
+      return { seat, bought: unit, goldCost: cost, bench: bench1, slots };
+    });
+
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
+
+app.post('/api/match/:matchId/board/place', async (req, res) => {
+  try {
+    const matchId = String(req.params?.matchId || '').trim();
+    const playerId = String(req.body?.playerId || '').trim();
+    const instanceId = String(req.body?.unitInstanceId || '').trim();
+    const x = asInt(req.body?.x, -1);
+    const y = asInt(req.body?.y, -1);
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId is required' });
+    if (!playerId) return res.status(400).json({ ok: false, error: 'playerId is required' });
+    if (!instanceId) return res.status(400).json({ ok: false, error: 'unitInstanceId is required' });
+    if (x < 0 || y < 0) return res.status(400).json({ ok: false, error: 'x,y are required' });
+
+    const out = await withTx(async (client) => {
+      const rp = await client.query(
+        `SELECT round, phase FROM match_rounds WHERE match_id=$1 ORDER BY round DESC LIMIT 1`,
+        [matchId]
+      );
+      const phase = String(rp.rows[0]?.phase || 'prep');
+      if (phase !== 'prep') throw new Error(`cannot place during phase=${phase}`);
+
+      const pr = await client.query(
+        `SELECT seat, board_state, bench_state FROM match_players WHERE match_id=$1 AND player_id=$2 FOR UPDATE`,
+        [matchId, playerId]
+      );
+      if (!pr.rows.length) throw new Error('player is not in this match');
+      const seat = asInt(pr.rows[0].seat, 1);
+      const board0 = normalizeBoard(pr.rows[0].board_state);
+      const bench0 = normalizeBench(pr.rows[0].bench_state);
+
+      if (x >= board0.w || y >= board0.h) throw new Error('out of bounds');
+      if (board0.units.some((u) => u && asInt(u.x, -999) === x && asInt(u.y, -999) === y)) throw new Error('cell occupied');
+
+      const u = findUnitInList(bench0.units, instanceId);
+      if (!u) throw new Error('unit not found in bench');
+
+      const bench1 = { ...bench0, units: bench0.units.filter((it) => String(it?.instanceId || '') !== instanceId) };
+      const placed = { ...u, x, y };
+      const board1 = { ...board0, units: board0.units.concat([placed]) };
+
+      await client.query(
+        `UPDATE match_players SET board_state=$3::jsonb, bench_state=$4::jsonb, updated_at=now() WHERE match_id=$1 AND seat=$2`,
+        [matchId, seat, JSON.stringify(board1), JSON.stringify(bench1)]
+      );
+
+      return { seat, placed, board: board1, bench: bench1 };
+    });
+
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
+
+app.post('/api/match/:matchId/board/remove', async (req, res) => {
+  try {
+    const matchId = String(req.params?.matchId || '').trim();
+    const playerId = String(req.body?.playerId || '').trim();
+    const instanceId = String(req.body?.unitInstanceId || '').trim();
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId is required' });
+    if (!playerId) return res.status(400).json({ ok: false, error: 'playerId is required' });
+    if (!instanceId) return res.status(400).json({ ok: false, error: 'unitInstanceId is required' });
+
+    const out = await withTx(async (client) => {
+      const rp = await client.query(
+        `SELECT round, phase FROM match_rounds WHERE match_id=$1 ORDER BY round DESC LIMIT 1`,
+        [matchId]
+      );
+      const phase = String(rp.rows[0]?.phase || 'prep');
+      if (phase !== 'prep') throw new Error(`cannot remove during phase=${phase}`);
+
+      const pr = await client.query(
+        `SELECT seat, board_state, bench_state FROM match_players WHERE match_id=$1 AND player_id=$2 FOR UPDATE`,
+        [matchId, playerId]
+      );
+      if (!pr.rows.length) throw new Error('player is not in this match');
+      const seat = asInt(pr.rows[0].seat, 1);
+      const board0 = normalizeBoard(pr.rows[0].board_state);
+      const bench0 = normalizeBench(pr.rows[0].bench_state);
+      if (bench0.units.length >= bench0.cap) throw new Error('bench is full');
+
+      const hit = findUnitInList(board0.units, instanceId);
+      if (!hit) throw new Error('unit not found on board');
+
+      const board1 = { ...board0, units: board0.units.filter((u) => String(u?.instanceId || '') !== instanceId) };
+      const bench1 = { ...bench0, units: bench0.units.concat([{ instanceId: hit.instanceId, unitId: hit.unitId, star: hit.star ?? 1 }]) };
+
+      await client.query(
+        `UPDATE match_players SET board_state=$3::jsonb, bench_state=$4::jsonb, updated_at=now() WHERE match_id=$1 AND seat=$2`,
+        [matchId, seat, JSON.stringify(board1), JSON.stringify(bench1)]
+      );
+      return { seat, removed: hit, board: board1, bench: bench1 };
+    });
+
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
+
+app.get('/api/match/:matchId/replay/:round', async (req, res) => {
+  try {
+    const matchId = String(req.params?.matchId || '').trim();
+    const round = asInt(req.params?.round, 0);
+    const playerId = String(req.query?.playerId || '').trim();
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId is required' });
+    if (!playerId) return res.status(400).json({ ok: false, error: 'playerId is required' });
+    if (round <= 0) return res.status(400).json({ ok: false, error: 'round must be >= 1' });
+
+    const out = await withTx(async (client) => {
+      const pr = await client.query(`SELECT seat FROM match_players WHERE match_id=$1 AND player_id=$2`, [matchId, playerId]);
+      if (!pr.rows.length) throw new Error('player is not in this match');
+      const rr = await client.query(`SELECT timeline, summary, created_at FROM match_replays WHERE match_id=$1 AND round=$2`, [matchId, round]);
+      if (!rr.rows.length) throw new Error('replay not found');
+      const r = rr.rows[0];
+      return { round, created_at: r.created_at, timeline: Array.isArray(r.timeline) ? r.timeline : [], summary: r.summary || {} };
+    });
+
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
+
+async function autobattlerTickOnce() {
+  const now = new Date();
+  const due = await pool.query(
+    `SELECT mr.match_id, mr.round, mr.phase
+     FROM match_rounds mr
+     JOIN matches m ON m.id = mr.match_id
+     WHERE m.status = 'ongoing'
+       AND mr.ends_at IS NOT NULL
+       AND mr.ends_at <= $1
+     ORDER BY mr.ends_at ASC
+     LIMIT 12`,
+    [now]
+  );
+  if (!due.rows.length) return { advanced: 0 };
+
+  let advanced = 0;
+  for (const row of due.rows) {
+    const matchId = String(row.match_id);
+    await withTx(async (client) => {
+      const mr = await client.query(
+        `SELECT match_id, round, phase, ends_at, resolved, result_json
+         FROM match_rounds
+         WHERE match_id=$1 AND round=$2
+         FOR UPDATE`,
+        [matchId, asInt(row.round, 1)]
+      );
+      if (!mr.rows.length) return;
+      const cur = mr.rows[0];
+      if (cur.ends_at && new Date(cur.ends_at).getTime() > Date.now()) return;
+
+      const matchRow = await client.query(`SELECT id, seed, status FROM matches WHERE id=$1 FOR UPDATE`, [matchId]);
+      if (!matchRow.rows.length) return;
+      if (String(matchRow.rows[0].status || '') !== 'ongoing') return;
+      const seed = String(matchRow.rows[0].seed || '').trim();
+
+      const roundNum = asInt(cur.round, 1);
+      const phase = String(cur.phase || 'prep');
+
+      const pAll = await client.query(
+        `SELECT seat, player_id, hp, gold, level, xp, board_state, bench_state, effects
+         FROM match_players
+         WHERE match_id=$1
+         ORDER BY seat ASC
+         FOR UPDATE`,
+        [matchId]
+      );
+      if (pAll.rows.length < 2) return;
+      const p1 = pAll.rows.find((p) => asInt(p.seat, 0) === 1);
+      const p2 = pAll.rows.find((p) => asInt(p.seat, 0) === 2);
+      if (!p1 || !p2) return;
+
+      const prepSeconds = 35;
+      const fightSeconds = 25;
+      const resultSeconds = 8;
+
+      if (phase === 'prep') {
+        // Bot: make sure it has something to fight with.
+        const sr = await client.query(`SELECT slots FROM match_shops WHERE match_id=$1 AND seat=2 FOR UPDATE`, [matchId]);
+        const slots = Array.isArray(sr.rows[0]?.slots) ? sr.rows[0].slots : [];
+        const offer = slots.find((s) => s && s.unitId) || null;
+
+        const p2r = await client.query(`SELECT board_state, bench_state FROM match_players WHERE match_id=$1 AND seat=2 FOR UPDATE`, [matchId]);
+        const b0 = normalizeBench(p2r.rows[0]?.bench_state);
+        const bd0 = normalizeBoard(p2r.rows[0]?.board_state);
+
+        if (!bd0.units.length && !b0.units.length && offer) {
+          const inst = `u_${sha256Hex(`${matchId}|bot|${roundNum}|${offer.unitId}`).slice(0, 10)}`;
+          b0.units.push({ instanceId: inst, unitId: offer.unitId, star: 1 });
+        }
+        if (b0.units.length) {
+          const u = b0.units.shift();
+          bd0.units.push({ ...u, x: 3, y: 0 });
+        }
+        await client.query(`UPDATE match_players SET board_state=$3::jsonb, bench_state=$4::jsonb, updated_at=now() WHERE match_id=$1 AND seat=2`, [
+          matchId,
+          2,
+          JSON.stringify(bd0),
+          JSON.stringify(b0)
+        ]);
+
+        const sim = simulateAutobattleRound({ matchId, matchSeed: seed, round: roundNum, p1, p2 });
+        await client.query(
+          `INSERT INTO match_replays (match_id, round, timeline, summary)
+           VALUES ($1, $2, $3::jsonb, $4::jsonb)
+           ON CONFLICT (match_id, round) DO UPDATE SET timeline=$3::jsonb, summary=$4::jsonb, created_at=now()`,
+          [matchId, roundNum, JSON.stringify(sim.timeline), JSON.stringify(sim.summary)]
+        );
+        await client.query(
+          `UPDATE match_rounds
+           SET phase='fight', ends_at=now()+interval '${fightSeconds} seconds', result_json=$3::jsonb
+           WHERE match_id=$1 AND round=$2`,
+          [matchId, roundNum, JSON.stringify({ ...(cur.result_json || {}), sim: sim.summary })]
+        );
+        advanced += 1;
+        return;
+      }
+
+      if (phase === 'fight') {
+        await client.query(
+          `UPDATE match_rounds
+           SET phase='result', ends_at=now()+interval '${resultSeconds} seconds'
+           WHERE match_id=$1 AND round=$2`,
+          [matchId, roundNum]
+        );
+        advanced += 1;
+        return;
+      }
+
+      if (phase === 'result') {
+        const resJson = cur.result_json || {};
+        const sim = resJson.sim || null;
+        if (!sim || !sim.winnerSeat) throw new Error('missing sim result');
+        const winnerSeat = asInt(sim.winnerSeat, 1);
+        const loserSeat = winnerSeat === 1 ? 2 : 1;
+        const dmg = asInt(sim.dmgToLoser, 5);
+
+        const winGold = 3;
+        const loseGold = 1;
+        const baseIncome = 5;
+
+        await client.query(
+          `UPDATE match_players
+           SET hp = GREATEST(0, hp - $3),
+               gold = gold + $4,
+               updated_at=now()
+           WHERE match_id=$1 AND seat=$2`,
+          [matchId, loserSeat, dmg, loseGold + baseIncome]
+        );
+        await client.query(
+          `UPDATE match_players
+           SET gold = gold + $3,
+               updated_at=now()
+           WHERE match_id=$1 AND seat=$2`,
+          [matchId, winnerSeat, winGold + baseIncome]
+        );
+
+        const hpq = await client.query(`SELECT seat, hp FROM match_players WHERE match_id=$1 ORDER BY seat`, [matchId]);
+        const dead = hpq.rows.find((p) => asInt(p.hp, 1) <= 0) || null;
+        if (dead) await client.query(`UPDATE matches SET status='finished', updated_at=now() WHERE id=$1`, [matchId]);
+
+        await client.query(`UPDATE match_rounds SET resolved=true, updated_at=now() WHERE match_id=$1 AND round=$2`, [matchId, roundNum]);
+
+        if (!dead) {
+          const nextRound = roundNum + 1;
+          await client.query(
+            `INSERT INTO match_rounds (match_id, round, phase, started_at, ends_at, resolved, result_json)
+             VALUES ($1, $2, 'prep', now(), now()+interval '${prepSeconds} seconds', false, '{}'::jsonb)
+             ON CONFLICT (match_id, round) DO UPDATE SET phase='prep', started_at=now(), ends_at=now()+interval '${prepSeconds} seconds', resolved=false, result_json='{}'::jsonb`,
+            [matchId, nextRound]
+          );
+          const shopRows = await client.query(`SELECT seat, locked, slots FROM match_shops WHERE match_id=$1 FOR UPDATE`, [matchId]);
+          for (const s of shopRows.rows) {
+            const seat = asInt(s.seat, 1);
+            const locked = Boolean(s.locked);
+            const nextSlots = locked ? (Array.isArray(s.slots) ? s.slots : []) : generateShopSlots({ matchSeed: seed, round: nextRound, rollsUsed: 0, count: 5 });
+            await client.query(
+              `UPDATE match_shops
+               SET round=$3, locked=false, rolls_used=0, slots=$4::jsonb, updated_at=now()
+               WHERE match_id=$1 AND seat=$2`,
+              [matchId, seat, nextRound, JSON.stringify(nextSlots)]
+            );
+          }
+        }
+
+        advanced += 1;
+        return;
+      }
+    });
+  }
+  return { advanced };
+}
 
 const port = Number(process.env.PORT || 3000);
 ensureBattleSchema()
@@ -5857,6 +6629,15 @@ ensureBattleSchema()
         }
       }, ms);
       if (typeof timer.unref === 'function') timer.unref();
+
+      const matchTick = setInterval(async () => {
+        try {
+          await autobattlerTickOnce();
+        } catch (err) {
+          if (process.env.LOG_MATCH_TICK === '1') console.error('match tick failed', err);
+        }
+      }, 1000);
+      if (typeof matchTick.unref === 'function') matchTick.unref();
     });
   })
   .catch((err) => {

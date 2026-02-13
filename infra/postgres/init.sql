@@ -159,3 +159,26 @@ CREATE TABLE IF NOT EXISTS match_rounds (
   PRIMARY KEY (match_id, round)
 );
 CREATE INDEX IF NOT EXISTS match_rounds_match_idx ON match_rounds (match_id);
+
+CREATE TABLE IF NOT EXISTS match_shops (
+  match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  seat INT NOT NULL,
+  round INT NOT NULL,
+  locked BOOLEAN NOT NULL DEFAULT FALSE,
+  rolls_used INT NOT NULL DEFAULT 0,
+  slots JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (match_id, seat)
+);
+CREATE INDEX IF NOT EXISTS match_shops_match_idx ON match_shops (match_id);
+
+CREATE TABLE IF NOT EXISTS match_replays (
+  match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  round INT NOT NULL,
+  timeline JSONB NOT NULL DEFAULT '[]'::jsonb,
+  summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (match_id, round)
+);
+CREATE INDEX IF NOT EXISTS match_replays_match_idx ON match_replays (match_id);
