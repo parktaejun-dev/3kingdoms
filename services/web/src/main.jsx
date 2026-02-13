@@ -271,6 +271,11 @@ function App() {
 
   const [playerId, setPlayerId] = React.useState(() => safeLocalStorageGet('playerId', ''));
   const [battleId, setBattleId] = React.useState(() => safeLocalStorageGet('battleId', ''));
+  const [matchId, setMatchId] = React.useState(() => safeLocalStorageGet('matchId', ''));
+  const [matchState, setMatchState] = React.useState(null);
+  const [matchReplay, setMatchReplay] = React.useState(null);
+  const [matchSelectedUnitId, setMatchSelectedUnitId] = React.useState('');
+  const [matchBusy, setMatchBusy] = React.useState(false);
 
   const [me, setMe] = React.useState(null);
   const [party, setParty] = React.useState({ count: 0 });
@@ -554,6 +559,138 @@ function App() {
     }
   }
 
+  function asNum(x, fallback = 0) {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  async function fetchMatchState({ mid = null } = {}) {
+    const id = String(mid || matchId || '').trim();
+    if (!playerId || !id) return null;
+    try {
+      const resp = await fetch(`/api/match/${encodeURIComponent(id)}/state?playerId=${encodeURIComponent(playerId)}`, { cache: 'no-store' });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data?.ok) return null;
+      setMatchState(data);
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  async function createMatch() {
+    if (!playerId) {
+      setUiError('먼저 bootstrap 실행');
+      return;
+    }
+    setMatchBusy(true);
+    setUiError('');
+    try {
+      const resp = await fetch('/api/match/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ playerId }),
+        cache: 'no-store'
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data?.ok || !data?.matchId) {
+        setUiError(`match create 실패: ${data?.error || `HTTP ${resp.status}`}`);
+        return;
+      }
+      safeLocalStorageSet('matchId', data.matchId);
+      setMatchId(data.matchId);
+      setMatchReplay(null);
+      setMatchSelectedUnitId('');
+      pushSystem(`매치 생성: ${String(data.matchId).slice(0, 8)}...`);
+      await fetchMatchState({ mid: data.matchId });
+    } finally {
+      setMatchBusy(false);
+    }
+  }
+
+  async function matchPost(path, body) {
+    if (!playerId || !matchId) return { ok: false, error: 'no match/player' };
+    try {
+      const resp = await fetch(`/api/match/${encodeURIComponent(matchId)}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ playerId, ...(body || {}) }),
+        cache: 'no-store'
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data?.ok) return data || { ok: false, error: `HTTP ${resp.status}` };
+      return data;
+    } catch (err) {
+      return { ok: false, error: err?.message ? String(err.message) : String(err) };
+    }
+  }
+
+  async function matchReroll() {
+    setMatchBusy(true);
+    const r = await matchPost('/shop/reroll', {});
+    setMatchBusy(false);
+    pushSystem(r.ok ? '리롤 완료' : `리롤 실패: ${r.error}`);
+    await fetchMatchState();
+  }
+
+  async function matchLock(nextLocked) {
+    setMatchBusy(true);
+    const r = await matchPost('/shop/lock', { locked: !!nextLocked });
+    setMatchBusy(false);
+    pushSystem(r.ok ? `상점 잠금: ${r.locked ? 'ON' : 'OFF'}` : `잠금 실패: ${r.error}`);
+    await fetchMatchState();
+  }
+
+  async function matchBuy(slotIndex) {
+    setMatchBusy(true);
+    const r = await matchPost('/shop/buy', { slotIndex });
+    setMatchBusy(false);
+    pushSystem(r.ok ? `구매: ${r?.bought?.unitId || 'unit'} (gold -${r.goldCost || 0})` : `구매 실패: ${r.error}`);
+    await fetchMatchState();
+  }
+
+  async function matchPlace(x, y) {
+    const uid = String(matchSelectedUnitId || '').trim();
+    if (!uid) {
+      pushSystem('벤치에서 유닛을 먼저 선택하세요.');
+      return;
+    }
+    setMatchBusy(true);
+    const r = await matchPost('/board/place', { unitInstanceId: uid, x, y });
+    setMatchBusy(false);
+    pushSystem(r.ok ? `배치: (${x},${y})` : `배치 실패: ${r.error}`);
+    if (r.ok) setMatchSelectedUnitId('');
+    await fetchMatchState();
+  }
+
+  async function matchRemove(unitInstanceId) {
+    const uid = String(unitInstanceId || '').trim();
+    if (!uid) return;
+    setMatchBusy(true);
+    const r = await matchPost('/board/remove', { unitInstanceId: uid });
+    setMatchBusy(false);
+    pushSystem(r.ok ? '회수: 벤치로 이동' : `회수 실패: ${r.error}`);
+    await fetchMatchState();
+  }
+
+  async function loadReplay(round) {
+    if (!playerId || !matchId) return;
+    const r = asNum(round, 0);
+    if (r <= 0) return;
+    try {
+      const resp = await fetch(`/api/match/${encodeURIComponent(matchId)}/replay/${encodeURIComponent(String(r))}?playerId=${encodeURIComponent(playerId)}`, { cache: 'no-store' });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data?.ok) {
+        pushSystem(`리플레이 실패: ${data?.error || `HTTP ${resp.status}`}`);
+        return;
+      }
+      setMatchReplay(data);
+      pushSystem(`리플레이 로드: R${r}`);
+    } catch (err) {
+      pushSystem(`리플레이 실패: ${err?.message ? String(err.message) : String(err)}`);
+    }
+  }
+
   React.useEffect(() => {
     if (mode !== 'ui') return;
     let cancelled = false;
@@ -571,6 +708,23 @@ function App() {
       clearInterval(t);
     };
   }, [mode, playerId]);
+
+  React.useEffect(() => {
+    if (mode !== 'ui') return;
+    if (!playerId || !matchId) return;
+    let cancelled = false;
+    async function tick() {
+      if (cancelled) return;
+      await fetchMatchState();
+    }
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, playerId, matchId]);
 
   React.useEffect(() => {
     if (mode !== 'ui') return;
@@ -2125,6 +2279,194 @@ function App() {
                     React.createElement('button', { className: 'btn-soft', onClick: () => setShowMapOverlay(true) }, 'Map'),
                     React.createElement('button', { className: 'btn-soft', onClick: () => openEmployCandidates() }, 'Employ')
                   )
+                ),
+                React.createElement(
+                  'div',
+                  { className: 'card' },
+                  React.createElement('div', { className: 'card-title' }, 'AUTO-BATTLER (1v1 · 7x4)'),
+                  React.createElement(
+                    'div',
+                    { className: 'hint', style: { marginBottom: 8 } },
+                    matchId ? `matchId: ${String(matchId).slice(0, 8)}...` : '매치를 생성하면 라운드가 자동 진행됩니다.'
+                  ),
+                  React.createElement(
+                    'div',
+                    { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 } },
+                    React.createElement(
+                      'button',
+                      { className: 'retro-btn pill', disabled: matchBusy, onClick: () => createMatch() },
+                      matchBusy ? '...' : matchId ? 'NEW MATCH' : 'CREATE MATCH'
+                    ),
+                    matchId
+                      ? React.createElement(
+                          'button',
+                          {
+                            className: 'retro-btn pill secondary',
+                            disabled: matchBusy,
+                            onClick: () => {
+                              safeLocalStorageSet('matchId', '');
+                              setMatchId('');
+                              setMatchState(null);
+                              setMatchReplay(null);
+                              setMatchSelectedUnitId('');
+                            }
+                          },
+                          'CLEAR'
+                        )
+                      : null,
+                    matchId
+                      ? React.createElement('button', { className: 'retro-btn pill secondary', disabled: matchBusy, onClick: () => fetchMatchState() }, 'REFRESH')
+                      : null
+                  ),
+                  (() => {
+                    if (!matchId || !matchState?.ok) return null;
+                    const ms = matchState;
+                    const round = ms.round || null;
+                    const phase = String(round?.phase || '-');
+                    const endsAt = round?.ends_at ? new Date(round.ends_at).getTime() : 0;
+                    const left = endsAt ? Math.max(0, Math.ceil((endsAt - Date.now()) / 1000)) : null;
+                    const my = ms.me || {};
+                    const opp = ms.opponent || {};
+                    const shop = my.shop || {};
+                    const slots = Array.isArray(shop.slots) ? shop.slots : [];
+
+                    const benchObj = my.bench && typeof my.bench === 'object' ? my.bench : {};
+                    const benchUnits = Array.isArray(benchObj.units)
+                      ? benchObj.units
+                      : Array.isArray(benchObj.slots)
+                        ? benchObj.slots.filter(Boolean)
+                        : [];
+
+                    const boardObj = my.board && typeof my.board === 'object' ? my.board : {};
+                    const boardUnits = Array.isArray(boardObj.units) ? boardObj.units : [];
+                    const unitAt = (x, y) => boardUnits.find((u) => u && Number(u.x) === x && Number(u.y) === y) || null;
+
+                    const grid = [];
+                    for (let y = 0; y < 4; y += 1) {
+                      const row = [];
+                      for (let x = 0; x < 7; x += 1) {
+                        const u = unitAt(x, y);
+                        const label = u ? String(u.unitId || '').slice(0, 8) : '';
+                        row.push(
+                          React.createElement(
+                            'button',
+                            {
+                              key: `cell-${x}-${y}`,
+                              className: 'btn-soft',
+                              style: { padding: '8px 6px', textAlign: 'center', minHeight: 34, opacity: matchBusy ? 0.7 : 1 },
+                              disabled: matchBusy,
+                              onClick: () => {
+                                if (u && u.instanceId) matchRemove(u.instanceId);
+                                else matchPlace(x, y);
+                              },
+                              title: u
+                                ? `REMOVE ${u.unitId} (${String(u.instanceId || '').slice(0, 8)}...)`
+                                : matchSelectedUnitId
+                                  ? `PLACE ${matchSelectedUnitId}`
+                                  : 'EMPTY'
+                            },
+                            label || '·'
+                          )
+                        );
+                      }
+                      grid.push(React.createElement('div', { key: `row-${y}`, style: { display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 6 } }, row));
+                    }
+
+                    const replayRound = phase === 'prep' ? Math.max(1, asNum(round?.round, 1) - 1) : asNum(round?.round, 1);
+
+                    return React.createElement(
+                      'div',
+                      null,
+                      React.createElement(
+                        'div',
+                        { className: 'hint', style: { marginBottom: 8 } },
+                        `R${round?.round ?? '-'} · ${phase.toUpperCase()}${left != null ? ` · ${left}s` : ''} · HP ${my.hp ?? '-'} vs ${opp.hp ?? '-'} · GOLD ${my.gold ?? '-'}`
+                      ),
+                      React.createElement('div', { className: 'hint', style: { marginBottom: 8 } }, `상점: ${shop.locked ? 'LOCKED' : 'OPEN'} · rolls ${shop.rollsUsed ?? 0}`),
+                      React.createElement(
+                        'div',
+                        { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 } },
+                        React.createElement('button', { className: 'retro-btn pill secondary', disabled: matchBusy || phase !== 'prep', onClick: () => matchReroll() }, 'REROLL (-2)'),
+                        React.createElement(
+                          'button',
+                          { className: 'retro-btn pill secondary', disabled: matchBusy, onClick: () => matchLock(!shop.locked) },
+                          shop.locked ? 'UNLOCK' : 'LOCK'
+                        ),
+                        React.createElement(
+                          'button',
+                          { className: 'retro-btn pill secondary', disabled: matchBusy, onClick: () => loadReplay(replayRound) },
+                          `REPLAY R${replayRound}`
+                        )
+                      ),
+                      React.createElement(
+                        'div',
+                        { style: { display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8, marginBottom: 10 } },
+                        slots.map((s, i) => {
+                          const empty = !s || !s.unitId;
+                          return React.createElement(
+                            'button',
+                            {
+                              key: `shop-${i}`,
+                              className: 'btn-soft',
+                              disabled: matchBusy || phase !== 'prep' || empty,
+                              onClick: () => matchBuy(i)
+                            },
+                            empty ? '—' : `${String(s.unitId).slice(0, 8)} · ${s.cost}G`
+                          );
+                        })
+                      ),
+                      React.createElement('div', { className: 'hint', style: { marginBottom: 6 } }, `벤치(${benchUnits.length}/${benchObj.cap ?? 8}): 클릭해서 배치 선택`),
+                      React.createElement(
+                        'div',
+                        { style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 10 } },
+                        benchUnits.length
+                          ? benchUnits.map((u) => {
+                              const id = String(u?.instanceId || '').trim();
+                              const active = id && id === matchSelectedUnitId;
+                              return React.createElement(
+                                'button',
+                                {
+                                  key: `bench-${id}`,
+                                  className: 'btn-soft',
+                                  style: { outline: active ? '2px solid rgba(54,243,177,0.65)' : 'none' },
+                                  disabled: matchBusy || !id || phase !== 'prep',
+                                  onClick: () => setMatchSelectedUnitId(active ? '' : id),
+                                  title: id
+                                },
+                                `${String(u?.unitId || '').slice(0, 10)}`
+                              );
+                            })
+                          : [React.createElement('div', { key: 'bench-empty', className: 'hint' }, '빈 벤치')]
+                      ),
+                      React.createElement('div', { className: 'hint', style: { marginBottom: 6 } }, '보드(7x4): 빈칸 클릭=배치, 유닛 클릭=회수'),
+                      React.createElement('div', { style: { display: 'grid', gap: 6, marginBottom: 10 } }, grid),
+                      matchReplay?.ok
+                        ? React.createElement(
+                            'div',
+                            { className: 'feed-item', style: { marginTop: 10 } },
+                            React.createElement('div', { className: 'feed-text text-glow' }, `REPLAY R${matchReplay.round}`),
+                            React.createElement(
+                              'div',
+                              { className: 'hint', style: { marginTop: 6 } },
+                              `events: ${(matchReplay.timeline || []).length} · winnerSeat: ${matchReplay.summary?.winnerSeat ?? '-'} · dmg: ${matchReplay.summary?.dmgToLoser ?? '-'}`
+                            ),
+                            React.createElement(
+                              'pre',
+                              { className: 'hint', style: { marginTop: 10, whiteSpace: 'pre-wrap' } },
+                              (matchReplay.timeline || [])
+                                .slice(0, 60)
+                                .map((e) => {
+                                  if (e.type === 'move') return `[${String(e.t).padStart(5)}] move ${e.src} (${e.from.x},${e.from.y})->(${e.to.x},${e.to.y})`;
+                                  if (e.type === 'attack') return `[${String(e.t).padStart(5)}] atk ${e.src} -> ${e.dst} -${e.amount} (hp:${e.dstHp})`;
+                                  if (e.type === 'death') return `[${String(e.t).padStart(5)}] death ${e.src}`;
+                                  return `[${String(e.t).padStart(5)}] ${e.type}`;
+                                })
+                                .join('\\n')
+                            )
+                          )
+                        : null
+                    );
+                  })()
                 )
               )
             ),
