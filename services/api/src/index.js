@@ -552,6 +552,55 @@ async function ensureBattleSchema() {
   await pool.query(`ALTER TABLE battles ADD COLUMN IF NOT EXISTS reward_granted BOOLEAN NOT NULL DEFAULT FALSE`);
 }
 
+async function ensureMatchSchema() {
+  // New mode: session-based auto-battler (1v1 first). Keep it isolated from the MUD loop tables.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS matches (
+      id TEXT PRIMARY KEY,
+      mode TEXT NOT NULL DEFAULT '1v1',
+      status TEXT NOT NULL DEFAULT 'lobby',
+      seed BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS match_players (
+      match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      seat INT NOT NULL,
+      player_id UUID REFERENCES players(id) ON DELETE CASCADE,
+      officer_id TEXT NOT NULL REFERENCES officers(id),
+      hp INT NOT NULL DEFAULT 100,
+      gold INT NOT NULL DEFAULT 0,
+      level INT NOT NULL DEFAULT 1,
+      xp INT NOT NULL DEFAULT 0,
+      board_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+      bench_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+      effects JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (match_id, seat)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS match_players_match_idx ON match_players (match_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS match_players_player_idx ON match_players (player_id)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS match_rounds (
+      match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      round INT NOT NULL,
+      phase TEXT NOT NULL DEFAULT 'prep',
+      started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      ends_at TIMESTAMPTZ,
+      resolved BOOLEAN NOT NULL DEFAULT FALSE,
+      result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      PRIMARY KEY (match_id, round)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS match_rounds_match_idx ON match_rounds (match_id)`);
+}
+
 async function ensureWorldSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS forces (
@@ -5592,8 +5641,187 @@ app.post('/api/battle/:battleId/action', async (req, res) => {
   }
 });
 
+function makeEmptyGrid(w, h, fill = null) {
+  const W = Math.max(1, Math.min(32, asInt(w, 7)));
+  const H = Math.max(1, Math.min(32, asInt(h, 4)));
+  return Array.from({ length: H }, () => Array.from({ length: W }, () => fill));
+}
+
+function randomSeed64String() {
+  // Store as base-10 string to avoid bigint/pg edge cases across runtimes.
+  const b = crypto.randomBytes(8);
+  const hex = b.toString('hex');
+  const n = BigInt(`0x${hex}`);
+  return n.toString(10);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-battler MVP (1v1, 7x4) endpoints (dev-grade: create + state)
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/api/match/create', async (req, res) => {
+  try {
+    const playerId = String(req.body?.playerId || '').trim();
+    const mode = '1v1';
+    if (!playerId) return res.status(400).json({ ok: false, error: 'playerId is required' });
+
+    const result = await withTx(async (client) => {
+      const pr = await client.query(`SELECT id, officer_id FROM players WHERE id = $1`, [playerId]);
+      if (!pr.rows.length) throw new Error('player not found');
+      const myOfficerId = String(pr.rows[0].officer_id || '').trim();
+      if (!myOfficerId) throw new Error('player has no officer');
+
+      const seed = randomSeed64String();
+      const idr = await client.query(`SELECT 'mat_' || substr(md5(random()::text),1,12) AS id`);
+      const matchId = String(idr.rows[0].id);
+
+      // Seat2 is a bot for MVP; keep it simple but pick a playable officer.
+      const bot = await client.query(
+        `SELECT id, name_kr
+         FROM officers
+         WHERE is_playable = true
+         ORDER BY random()
+         LIMIT 1`
+      );
+      const botOfficerId = String(bot.rows[0]?.id || 'player_default');
+      const botOfficerName = String(bot.rows[0]?.name_kr || 'BOT');
+
+      await client.query(`INSERT INTO matches (id, mode, status, seed) VALUES ($1, $2, $3, $4)`, [
+        matchId,
+        mode,
+        'ongoing',
+        seed
+      ]);
+
+      const board = { w: 7, h: 4, cells: makeEmptyGrid(7, 4, null), units: [] };
+      const bench = { slots: [], cap: 8 };
+      const effects = {};
+
+      await client.query(
+        `INSERT INTO match_players (match_id, seat, player_id, officer_id, hp, gold, level, xp, board_state, bench_state, effects)
+         VALUES ($1, 1, $2, $3, 100, 0, 1, 0, $4::jsonb, $5::jsonb, $6::jsonb)`,
+        [matchId, playerId, myOfficerId, JSON.stringify(board), JSON.stringify(bench), JSON.stringify(effects)]
+      );
+      await client.query(
+        `INSERT INTO match_players (match_id, seat, player_id, officer_id, hp, gold, level, xp, board_state, bench_state, effects)
+         VALUES ($1, 2, NULL, $2, 100, 0, 1, 0, $3::jsonb, $4::jsonb, $5::jsonb)`,
+        [matchId, botOfficerId, JSON.stringify(board), JSON.stringify(bench), JSON.stringify(effects)]
+      );
+
+      await client.query(
+        `INSERT INTO match_rounds (match_id, round, phase, started_at, ends_at, resolved, result_json)
+         VALUES ($1, 1, 'prep', now(), now() + interval '35 seconds', false, '{}'::jsonb)
+         ON CONFLICT (match_id, round) DO NOTHING`,
+        [matchId]
+      );
+
+      return {
+        matchId,
+        mode,
+        seed,
+        me: { seat: 1, playerId, officerId: myOfficerId, hp: 100, gold: 0, level: 1, xp: 0 },
+        opponent: { seat: 2, playerId: null, officerId: botOfficerId, name: botOfficerName, hp: 100, gold: 0, level: 1, xp: 0 }
+      };
+    });
+
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
+
+app.get('/api/match/:matchId/state', async (req, res) => {
+  try {
+    const matchId = String(req.params?.matchId || '').trim();
+    const playerId = String(req.query?.playerId || '').trim();
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId is required' });
+    if (!playerId) return res.status(400).json({ ok: false, error: 'playerId is required' });
+
+    const out = await withTx(async (client) => {
+      const mq = await client.query(`SELECT id, mode, status, seed, created_at, updated_at FROM matches WHERE id = $1`, [matchId]);
+      if (!mq.rows.length) throw new Error('match not found');
+      const m = mq.rows[0];
+
+      const pq = await client.query(
+        `SELECT seat, player_id, officer_id, hp, gold, level, xp, board_state, bench_state, effects
+         FROM match_players
+         WHERE match_id = $1
+         ORDER BY seat ASC`,
+        [matchId]
+      );
+      if (!pq.rows.length) throw new Error('match has no players');
+
+      const meRow = pq.rows.find((r) => String(r.player_id || '') === playerId);
+      if (!meRow) throw new Error('player is not in this match');
+      const oppRow = pq.rows.find((r) => asInt(r.seat, 0) !== asInt(meRow.seat, 0)) || null;
+
+      const rq = await client.query(
+        `SELECT round, phase, started_at, ends_at, resolved, result_json
+         FROM match_rounds
+         WHERE match_id = $1
+         ORDER BY round DESC
+         LIMIT 1`,
+        [matchId]
+      );
+      const round = rq.rows[0] || null;
+
+      return {
+        match: {
+          id: m.id,
+          mode: m.mode,
+          status: m.status,
+          seed: String(m.seed),
+          created_at: m.created_at,
+          updated_at: m.updated_at
+        },
+        round: round
+          ? {
+              round: asInt(round.round, 1),
+              phase: String(round.phase || 'prep'),
+              started_at: round.started_at,
+              ends_at: round.ends_at,
+              resolved: Boolean(round.resolved),
+              result: round.result_json || {}
+            }
+          : null,
+        me: {
+          seat: asInt(meRow.seat, 1),
+          playerId: meRow.player_id,
+          officerId: meRow.officer_id,
+          hp: asInt(meRow.hp, 0),
+          gold: asInt(meRow.gold, 0),
+          level: asInt(meRow.level, 1),
+          xp: asInt(meRow.xp, 0),
+          board: meRow.board_state || {},
+          bench: meRow.bench_state || {},
+          effects: meRow.effects || {}
+        },
+        opponent: oppRow
+          ? {
+              seat: asInt(oppRow.seat, 2),
+              playerId: oppRow.player_id,
+              officerId: oppRow.officer_id,
+              hp: asInt(oppRow.hp, 0),
+              gold: asInt(oppRow.gold, 0),
+              level: asInt(oppRow.level, 1),
+              xp: asInt(oppRow.xp, 0),
+              board: oppRow.board_state || {},
+              bench: oppRow.bench_state || {},
+              effects: oppRow.effects || {}
+            }
+          : null
+      };
+    });
+
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
+
 const port = Number(process.env.PORT || 3000);
 ensureBattleSchema()
+  .then(() => ensureMatchSchema())
   .then(() => ensureWorldSchema())
   .then(() => ensureGameTimeSchema())
   .then(() => ensureOfficerRoleSchema())

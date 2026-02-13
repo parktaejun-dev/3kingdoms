@@ -115,3 +115,47 @@ ON CONFLICT (id) DO NOTHING;
 -- NOTE:
 -- World/scenario seed data is owned by the API boot seeder (services/api/src/seeds/world190.js).
 -- Keeping init.sql seedless prevents mismatches between scenario variants.
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Auto-battler (1v1) schema (new mode; does not replace the MUD loop tables)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS matches (
+  id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL DEFAULT '1v1',
+  status TEXT NOT NULL DEFAULT 'lobby',
+  seed BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS match_players (
+  match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  seat INT NOT NULL,
+  player_id UUID REFERENCES players(id) ON DELETE CASCADE,
+  officer_id TEXT NOT NULL REFERENCES officers(id),
+  hp INT NOT NULL DEFAULT 100,
+  gold INT NOT NULL DEFAULT 0,
+  level INT NOT NULL DEFAULT 1,
+  xp INT NOT NULL DEFAULT 0,
+  board_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+  bench_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+  effects JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (match_id, seat)
+);
+CREATE INDEX IF NOT EXISTS match_players_match_idx ON match_players (match_id);
+CREATE INDEX IF NOT EXISTS match_players_player_idx ON match_players (player_id);
+
+CREATE TABLE IF NOT EXISTS match_rounds (
+  match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  round INT NOT NULL,
+  phase TEXT NOT NULL DEFAULT 'prep',
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ends_at TIMESTAMPTZ,
+  resolved BOOLEAN NOT NULL DEFAULT FALSE,
+  result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (match_id, round)
+);
+CREATE INDEX IF NOT EXISTS match_rounds_match_idx ON match_rounds (match_id);
