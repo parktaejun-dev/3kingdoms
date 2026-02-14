@@ -4,6 +4,7 @@ import { Terminal } from 'xterm';
 import { io } from 'socket.io-client';
 import 'xterm/css/xterm.css';
 import './ui.css';
+import { vnDefaultRun, vnScenes } from './vnData.js';
 
 function uuid() {
   // crypto.randomUUID() requires a secure context (https/localhost). This service is plain http.
@@ -49,6 +50,15 @@ function safeLocalStorageSet(key, value) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function safeJsonParse(text, fallback = null) {
+  try {
+    const v = JSON.parse(String(text || ''));
+    return v == null ? fallback : v;
+  } catch {
+    return fallback;
   }
 }
 
@@ -294,13 +304,16 @@ function App() {
   const [protoSim, setProtoSim] = React.useState(null);
   const [protoBusy, setProtoBusy] = React.useState(false);
   const [protoPlay, setProtoPlay] = React.useState({ on: false, t: 0, units: {}, idx: 0 });
-  const [vnState, setVnState] = React.useState(() => ({
-    step: 'pick', // pick | scene1 | battle | result
-    hero: 'xuchu',
-    // Applied as seatMods in proto simulate
-    seatMods: { seat1: {}, seat2: {} },
-    lastSim: null
-  }));
+  const VN_SAVE_KEY = 'vnRunState_v1';
+  const [vnRun, setVnRun] = React.useState(() => {
+    const saved = safeJsonParse(safeLocalStorageGet(VN_SAVE_KEY, ''), null);
+    if (saved && typeof saved === 'object' && saved.sceneId) return saved;
+    return vnDefaultRun();
+  });
+  const [vnTyping, setVnTyping] = React.useState({ on: true, shown: 0 });
+  const vnAllScenes = React.useMemo(() => vnScenes(), []);
+  const vnScene = React.useMemo(() => vnAllScenes.find((s) => s.id === vnRun.sceneId) || vnAllScenes[0], [vnAllScenes, vnRun.sceneId]);
+  const vnHero = React.useMemo(() => String(vnRun.hero || 'xuchu'), [vnRun.hero]);
 
   const [me, setMe] = React.useState(null);
   const [party, setParty] = React.useState({ count: 0 });
@@ -425,26 +438,35 @@ function App() {
 
   async function vnSimulateBattle() {
     const seed = String(Date.now());
-    // Simple fixed formations for MVP VN loop.
-    const hero = String(vnState.hero || 'xuchu');
-    const p1Units = [{ unitId: hero, x: 1, y: 2 }, { unitId: 'xunyu', x: 2, y: 2 }]; // hero + strategist
-    const p2Units = [{ unitId: 'dianwei', x: 1, y: 0 }, { unitId: 'zhangliao', x: 2, y: 0 }]; // tank + diver
+    const hero = vnHero;
+    const battle = vnScene && vnScene.type === 'battle' ? vnScene.battle : null;
+    const p1T = Array.isArray(battle?.p1) ? battle.p1 : [];
+    const p2T = Array.isArray(battle?.p2) ? battle.p2 : [];
+    const p1Units = p1T.map((u) => ({ ...u, unitId: u.unitId === '$HERO' ? hero : u.unitId }));
+    const p2Units = p2T.map((u) => ({ ...u, unitId: u.unitId === '$HERO' ? hero : u.unitId }));
     try {
       const resp = await fetch('/api/proto/battle/simulate', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ seed, p1Units, p2Units, seatMods: vnState.seatMods }),
+        body: JSON.stringify({ seed, p1Units, p2Units, seatMods: vnRun.nextBattleMods || {} }),
         cache: 'no-store'
       });
       const data = await resp.json().catch(() => null);
-      setVnState((prev) => ({ ...prev, lastSim: data, step: 'result' }));
+      setVnRun((prev) => {
+        const next = { ...prev, lastBattle: data, lastBattleSceneId: prev.sceneId, nextBattleMods: { seat1: {}, seat2: {} } };
+        safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+        return next;
+      });
     } catch (err) {
-      setVnState((prev) => ({ ...prev, lastSim: { ok: false, error: err?.message ? String(err.message) : String(err) }, step: 'result' }));
+      setVnRun((prev) => {
+        const next = { ...prev, lastBattle: { ok: false, error: err?.message ? String(err.message) : String(err) }, lastBattleSceneId: prev.sceneId };
+        safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+        return next;
+      });
     }
   }
 
   function renderVn() {
-    const hero = String(vnState.hero || 'xuchu');
     const roster = protoRoster.length
       ? protoRoster
       : [
@@ -453,7 +475,8 @@ function App() {
           { unitId: 'xunyu', name: '순욱', role: 'strategist' },
           { unitId: 'dianwei', name: '전위', role: 'tank' }
         ];
-    const heroObj = roster.find((u) => String(u.unitId) === hero) || roster[0];
+    const heroObj = roster.find((u) => String(u.unitId) === vnHero) || roster[0];
+    const bodyText = String(vnScene?.body || '');
 
     const topBar = React.createElement(
       'div',
@@ -476,7 +499,10 @@ function App() {
       )
     );
 
-    if (vnState.step === 'pick') {
+    const typed = vnTyping.on ? bodyText.slice(0, Math.max(0, vnTyping.shown)) : bodyText;
+
+    if (vnScene?.type === 'pick') {
+      const hasSave = !!safeJsonParse(safeLocalStorageGet(VN_SAVE_KEY, ''), null)?.sceneId && safeLocalStorageGet(VN_SAVE_KEY, '') !== '';
       return React.createElement(
         'div',
         { className: 'vn-root' },
@@ -494,8 +520,14 @@ function App() {
                 'button',
                 {
                   key: `vn-pick-${u.unitId}`,
-                  className: `vn-card ${hero === u.unitId ? 'active' : ''}`,
-                  onClick: () => setVnState((prev) => ({ ...prev, hero: String(u.unitId) }))
+                  className: `vn-card ${vnHero === u.unitId ? 'active' : ''}`,
+                  onClick: () => {
+                    setVnRun((prev) => {
+                      const next = { ...prev, hero: String(u.unitId) };
+                      safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+                      return next;
+                    });
+                  }
                 },
                 React.createElement('div', { className: 'vn-card-title' }, u.name),
                 React.createElement('div', { className: 'vn-card-meta' }, String(u.role || '').toUpperCase()),
@@ -504,60 +536,106 @@ function App() {
             )
           ),
           React.createElement(
-            'button',
-            { className: 'vn-cta', onClick: () => setVnState((prev) => ({ ...prev, step: 'scene1', seatMods: { seat1: {}, seat2: {} }, lastSim: null })) },
-            '시작'
-          )
-        )
-      );
-    }
-
-    if (vnState.step === 'scene1') {
-      const body =
-        '건안 5년(200년). 관도.\n조조 2만 vs 원소 10만.\n당신의 선택이 전장을 바꾼다.';
-      return React.createElement(
-        'div',
-        { className: 'vn-root' },
-        topBar,
-        React.createElement(
-          'div',
-          { className: 'vn-stage' },
-          React.createElement('div', { className: 'vn-portrait' }, React.createElement(PixelPortrait, { seedText: heroObj?.unitId || hero, size: 96, className: 'avatar avatar-pixel' })),
-          React.createElement('div', { className: 'vn-title' }, `${heroObj?.name || '장수'} · 관도대전`),
-          React.createElement('div', { className: 'vn-body' }, body),
-          React.createElement(
             'div',
             { className: 'vn-choices' },
+            hasSave
+              ? React.createElement(
+                  'button',
+                  {
+                    className: 'vn-choice',
+                    onClick: () => {
+                      const saved = safeJsonParse(safeLocalStorageGet(VN_SAVE_KEY, ''), null);
+                      if (saved && saved.sceneId) setVnRun(saved);
+                    }
+                  },
+                  '이어하기'
+                )
+              : null,
             React.createElement(
               'button',
               {
-                className: 'vn-choice',
-                onClick: () => setVnState((prev) => ({ ...prev, seatMods: { seat1: { defPct: 0.2 }, seat2: {} }, step: 'battle' }))
+                className: 'vn-cta',
+                onClick: () =>
+                  setVnRun((prev) => {
+                    const next = { ...prev, sceneId: 's1_intro', nextBattleMods: { seat1: {}, seat2: {} }, lastBattle: null, history: [] };
+                    safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+                    return next;
+                  })
               },
-              '방어를 굳힌다 (아군 방어 +20%)'
-            ),
-            React.createElement(
-              'button',
-              {
-                className: 'vn-choice',
-                onClick: () => setVnState((prev) => ({ ...prev, seatMods: { seat1: { atkPct: 0.15 }, seat2: {} }, step: 'battle' }))
-              },
-              '정면 돌파 (아군 공격 +15%)'
-            ),
-            React.createElement(
-              'button',
-              {
-                className: 'vn-choice',
-                onClick: () => setVnState((prev) => ({ ...prev, seatMods: { seat1: {}, seat2: { hpPct: -0.2 } }, step: 'battle' }))
-              },
-              '오소 화공 (적 체력 -20%)'
+              '새 런 시작'
             )
           )
         )
       );
     }
 
-    if (vnState.step === 'battle') {
+    function applyEffects(eff) {
+      const effects = eff && typeof eff === 'object' ? eff : {};
+      setVnRun((prev) => {
+        if (effects.resetAll) {
+          const next = { ...vnDefaultRun(), hero: prev.hero, sceneId: 'pick' };
+          safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+          return next;
+        }
+        if (effects.resetTo) {
+          const next = { ...prev, sceneId: String(effects.resetTo), nextBattleMods: { seat1: {}, seat2: {} }, lastBattle: null, history: prev.history.slice(0, 0) };
+          safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+          return next;
+        }
+        const next = { ...prev };
+        if (effects.alignment) next.alignment = String(effects.alignment);
+        if (typeof effects.fame === 'number') next.fame = (next.fame || 0) + effects.fame;
+        if (typeof effects.infamy === 'number') next.infamy = (next.infamy || 0) + effects.infamy;
+        if (typeof effects.trust === 'number') next.trust = (next.trust || 0) + effects.trust;
+        if (effects.nextBattleMods && typeof effects.nextBattleMods === 'object') {
+          const nb = next.nextBattleMods && typeof next.nextBattleMods === 'object' ? next.nextBattleMods : { seat1: {}, seat2: {} };
+          const s1 = { ...(nb.seat1 || {}) };
+          const s2 = { ...(nb.seat2 || {}) };
+          if (effects.nextBattleMods.seat1) {
+            for (const [k, v] of Object.entries(effects.nextBattleMods.seat1)) s1[k] = (s1[k] || 0) + Number(v || 0);
+          }
+          if (effects.nextBattleMods.seat2) {
+            for (const [k, v] of Object.entries(effects.nextBattleMods.seat2)) s2[k] = (s2[k] || 0) + Number(v || 0);
+          }
+          next.nextBattleMods = { seat1: s1, seat2: s2 };
+        }
+        next.history = (Array.isArray(next.history) ? next.history : []).concat([{ t: new Date().toISOString(), sceneId: prev.sceneId, choiceId: effects._choiceId || '' }]).slice(-60);
+        safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+        return next;
+      });
+    }
+
+    function goNext(nextId) {
+      setVnRun((prev) => {
+        const next = { ...prev, sceneId: String(nextId || 'pick') };
+        safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+        return next;
+      });
+      setVnTyping({ on: true, shown: 0 });
+    }
+
+    React.useEffect(() => {
+      setVnTyping({ on: true, shown: 0 });
+    }, [vnRun.sceneId]);
+
+    React.useEffect(() => {
+      if (!vnTyping.on) return;
+      const total = bodyText.length;
+      if (vnTyping.shown >= total) return;
+      const t = setInterval(() => {
+        setVnTyping((p) => {
+          const n = Math.min(total, (p.shown || 0) + 2);
+          return { ...p, shown: n };
+        });
+      }, 16);
+      return () => clearInterval(t);
+    }, [vnTyping.on, vnTyping.shown, bodyText]);
+
+    function skipTyping() {
+      setVnTyping({ on: false, shown: bodyText.length });
+    }
+
+    if (vnScene?.type === 'story') {
       return React.createElement(
         'div',
         { className: 'vn-root' },
@@ -565,20 +643,146 @@ function App() {
         React.createElement(
           'div',
           { className: 'vn-stage' },
-          React.createElement('div', { className: 'vn-title' }, '전투'),
-          React.createElement('div', { className: 'vn-body' }, '자동전투로 검증합니다. (고정 편성)'),
-          React.createElement('div', { className: 'vn-body' }, `아군: ${heroObj?.name || hero} + 순욱  |  적군: 전위 + 장료`),
+          React.createElement('div', { className: 'vn-portrait' }, React.createElement(PixelPortrait, { seedText: heroObj?.unitId || vnHero, size: 96, className: 'avatar avatar-pixel' })),
+          React.createElement('div', { className: 'vn-title' }, vnScene.title || `${heroObj?.name || '장수'} · 관도대전`),
           React.createElement(
-            'button',
-            { className: 'vn-cta', onClick: () => vnSimulateBattle() },
-            '전투 시작'
+            'div',
+            {
+              className: 'vn-body',
+              role: 'button',
+              tabIndex: 0,
+              onClick: () => skipTyping(),
+              onKeyDown: (e) => {
+                if (e.key === 'Enter') skipTyping();
+              }
+            },
+            typed
+          ),
+          React.createElement('div', { className: 'vn-sub' }, `명성 ${vnRun.fame || 0} · 악명 ${vnRun.infamy || 0} · 신뢰 ${vnRun.trust || 0}`),
+          React.createElement(
+            'div',
+            { className: 'vn-choices' },
+            (Array.isArray(vnScene.choices) ? vnScene.choices : []).slice(0, 3).map((c) =>
+              React.createElement(
+                'button',
+                {
+                  key: `vn-ch-${c.id}`,
+                  className: 'vn-choice',
+                  onClick: () => {
+                    const eff = { ...(c.effects || {}), _choiceId: c.id };
+                    applyEffects(eff);
+                    goNext(c.next);
+                  }
+                },
+                String(c.label || c.id)
+              )
+            )
           )
         )
       );
     }
 
-    const sim = vnState.lastSim;
-    const ok = sim && sim.ok;
+    if (vnScene?.type === 'battle') {
+      const lastBattleForThis = vnRun.lastBattle && vnRun.lastBattleSceneId === vnRun.sceneId ? vnRun.lastBattle : null;
+      if (lastBattleForThis) {
+        const sim = lastBattleForThis;
+        const ok = !!sim.ok;
+        return React.createElement(
+          'div',
+          { className: 'vn-root' },
+          topBar,
+          React.createElement(
+            'div',
+            { className: 'vn-stage' },
+            React.createElement('div', { className: 'vn-title' }, ok ? `결과: SEAT ${sim.analysis?.winnerSeat ?? sim.summary?.winnerSeat ?? '-'}` : '오류'),
+            React.createElement('div', { className: 'vn-body' }, ok ? (sim.analysis?.reason || '') : String(sim?.error || 'unknown')),
+            ok ? React.createElement('div', { className: 'vn-sub' }, (sim.analysis?.reasons || []).join(' · ')) : null,
+            React.createElement(
+              'div',
+              { className: 'vn-choices' },
+              React.createElement(
+                'button',
+                {
+                  className: 'vn-cta',
+                  onClick: () => {
+                    setVnRun((prev) => {
+                      const next = { ...prev, sceneId: String(vnScene.next || 's5_wrap') };
+                      safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+                      return next;
+                    });
+                  }
+                },
+                '계속'
+              )
+            )
+          )
+        );
+      }
+      return React.createElement(
+        'div',
+        { className: 'vn-root' },
+        topBar,
+        React.createElement(
+          'div',
+          { className: 'vn-stage' },
+          React.createElement('div', { className: 'vn-title' }, vnScene.title || '전투'),
+          React.createElement(
+            'div',
+            { className: 'vn-body' },
+            `${vnScene.body || ''}\n\n(선택 효과)\n아군: atk ${((vnRun.nextBattleMods?.seat1?.atkPct || 0) * 100).toFixed(0)}% · def ${((vnRun.nextBattleMods?.seat1?.defPct || 0) * 100).toFixed(0)}% · hp ${((vnRun.nextBattleMods?.seat1?.hpPct || 0) * 100).toFixed(0)}%\n적군: atk ${((vnRun.nextBattleMods?.seat2?.atkPct || 0) * 100).toFixed(0)}% · def ${((vnRun.nextBattleMods?.seat2?.defPct || 0) * 100).toFixed(0)}% · hp ${((vnRun.nextBattleMods?.seat2?.hpPct || 0) * 100).toFixed(0)}%`
+          ),
+          React.createElement('button', { className: 'vn-cta', onClick: () => vnSimulateBattle() }, '전투 시작')
+        )
+      );
+    }
+
+    // wrap or implicit "result" for battles
+    const sim = vnRun.lastBattle;
+    const ok = !!(sim && sim.ok);
+    if (vnScene?.type === 'wrap') {
+      const last = vnRun.lastBattle && vnRun.lastBattle.ok ? vnRun.lastBattle : null;
+      const lines = [
+        `장수: ${heroObj?.name || vnHero}`,
+        `명성: ${vnRun.fame || 0}`,
+        `악명: ${vnRun.infamy || 0}`,
+        `신뢰: ${vnRun.trust || 0}`
+      ];
+      if (last) {
+        lines.push('');
+        lines.push(`전투 결론: SEAT ${last.analysis?.winnerSeat ?? last.summary?.winnerSeat ?? '-'}`);
+        lines.push(String(last.analysis?.reason || ''));
+      }
+      return React.createElement(
+        'div',
+        { className: 'vn-root' },
+        topBar,
+        React.createElement(
+          'div',
+          { className: 'vn-stage' },
+          React.createElement('div', { className: 'vn-title' }, vnScene.title || '결산'),
+          React.createElement('div', { className: 'vn-body' }, lines.join('\n')),
+          React.createElement(
+            'div',
+            { className: 'vn-choices' },
+            (Array.isArray(vnScene.choices) ? vnScene.choices : []).slice(0, 3).map((c) =>
+              React.createElement(
+                'button',
+                {
+                  key: `vn-wrap-${c.id}`,
+                  className: 'vn-choice',
+                  onClick: () => {
+                    applyEffects({ ...(c.effects || {}), _choiceId: c.id });
+                    goNext(c.next);
+                  }
+                },
+                String(c.label || c.id)
+              )
+            )
+          )
+        )
+      );
+    }
+
     return React.createElement(
       'div',
       { className: 'vn-root' },
@@ -594,13 +798,28 @@ function App() {
           { className: 'vn-choices' },
           React.createElement(
             'button',
-            { className: 'vn-choice', onClick: () => setVnState((prev) => ({ ...prev, step: 'scene1', lastSim: null })) },
-            '다른 선택 해보기'
+            {
+              className: 'vn-choice',
+              onClick: () => {
+                // Move to the next scene after a battle (based on scene config).
+                const nextId = vnScene && vnScene.type === 'battle' ? vnScene.next : 's5_wrap';
+                goNext(nextId);
+              }
+            },
+            '계속'
           ),
           React.createElement(
             'button',
-            { className: 'vn-choice', onClick: () => setVnState((prev) => ({ ...prev, step: 'pick', lastSim: null })) },
-            '장수 다시 선택'
+            {
+              className: 'vn-choice',
+              onClick: () => {
+                const next = vnDefaultRun();
+                next.hero = vnHero;
+                safeLocalStorageSet(VN_SAVE_KEY, JSON.stringify(next));
+                setVnRun(next);
+              }
+            },
+            '런 초기화'
           )
         )
       )
