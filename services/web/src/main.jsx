@@ -286,6 +286,14 @@ function App() {
   const [matchReplay, setMatchReplay] = React.useState(null);
   const [matchSelectedUnitId, setMatchSelectedUnitId] = React.useState('');
   const [matchBusy, setMatchBusy] = React.useState(false);
+  // Stateless battle prototype (4x3) - used to validate "is combat fun" independent of 7x4 readability.
+  const [protoRoster, setProtoRoster] = React.useState([]);
+  const [protoSeed, setProtoSeed] = React.useState(() => String(Date.now()));
+  const [protoSelected, setProtoSelected] = React.useState('xuchu');
+  const [protoGrid, setProtoGrid] = React.useState(() => Array(24).fill(null)); // 4x6 global board (enemy 3 rows + player 3 rows)
+  const [protoSim, setProtoSim] = React.useState(null);
+  const [protoBusy, setProtoBusy] = React.useState(false);
+  const [protoPlay, setProtoPlay] = React.useState({ on: false, t: 0, units: {}, idx: 0 });
 
   const [me, setMe] = React.useState(null);
   const [party, setParty] = React.useState({ count: 0 });
@@ -347,6 +355,99 @@ function App() {
     }, 800);
     return () => clearInterval(t);
   }, [localNotes.length]);
+
+  React.useEffect(() => {
+    // Load roster for the 4x3 stateless battle prototype.
+    fetch('/api/proto/battle/roster', { cache: 'no-store' })
+      .then((r) => r.json().catch(() => null))
+      .then((data) => {
+        if (data && data.ok && Array.isArray(data.roster)) setProtoRoster(data.roster);
+      })
+      .catch(() => null);
+  }, []);
+
+  function protoCellToLocal(idx) {
+    const x = idx % 4;
+    const y = Math.floor(idx / 4);
+    const seat = y < 3 ? 2 : 1; // top 3 rows = enemy
+    const localY = seat === 1 ? y - 3 : y;
+    return { x, y, seat, localY };
+  }
+
+  function protoSetCell(idx, unitId) {
+    setProtoGrid((prev) => {
+      const next = prev.slice();
+      next[idx] = unitId || null;
+      return next;
+    });
+  }
+
+  function protoUnitsFromGrid(seat) {
+    const units = [];
+    for (let i = 0; i < protoGrid.length; i += 1) {
+      const unitId = protoGrid[i];
+      if (!unitId) continue;
+      const c = protoCellToLocal(i);
+      if (c.seat !== seat) continue;
+      units.push({ unitId, x: c.x, y: c.localY });
+    }
+    return units;
+  }
+
+  async function protoSimulate() {
+    setProtoBusy(true);
+    setProtoSim(null);
+    setProtoPlay({ on: false, t: 0, units: {}, idx: 0 });
+    try {
+      const p1Units = protoUnitsFromGrid(1);
+      const p2Units = protoUnitsFromGrid(2);
+      const resp = await fetch('/api/proto/battle/simulate', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ seed: protoSeed, p1Units, p2Units }),
+        cache: 'no-store'
+      });
+      const data = await resp.json().catch(() => null);
+      setProtoSim(data && data.ok ? data : { ok: false, error: data?.error || `HTTP ${resp.status}` });
+    } catch (err) {
+      setProtoSim({ ok: false, error: err?.message ? String(err.message) : String(err) });
+    } finally {
+      setProtoBusy(false);
+    }
+  }
+
+  React.useEffect(() => {
+    if (!protoSim || !protoSim.ok || !protoPlay.on) return;
+    const timeline = Array.isArray(protoSim.timeline) ? protoSim.timeline : [];
+    const byTime = timeline.slice().sort((a, b) => (a.t ?? 0) - (b.t ?? 0));
+    const tick = 100;
+    const timer = setInterval(() => {
+      setProtoPlay((prev) => {
+        if (!prev.on) return prev;
+        const nextT = prev.t + tick;
+        const units = { ...prev.units };
+        let idx = prev.idx;
+        while (idx < byTime.length && (byTime[idx].t ?? 0) <= nextT) {
+          const e = byTime[idx];
+          if (e.type === 'move' && units[e.src]) {
+            units[e.src] = { ...units[e.src], x: e.to?.x ?? units[e.src].x, y: e.to?.y ?? units[e.src].y };
+          } else if ((e.type === 'attack' || e.type === 'hit' || e.type === 'dot' || e.type === 'trap_hit') && units[e.dst]) {
+            units[e.dst] = { ...units[e.dst], hp: e.dstHp ?? units[e.dst].hp };
+          } else if (e.type === 'death' && units[e.src]) {
+            units[e.src] = { ...units[e.src], hp: 0 };
+          } else if (e.type === 'knockback' && units[e.dst]) {
+            units[e.dst] = { ...units[e.dst], x: e.to?.x ?? units[e.dst].x, y: e.to?.y ?? units[e.dst].y };
+          } else if (e.type === 'skill' && (e.skill === 'execute' || e.skill === 'charge') && units[e.src]) {
+            units[e.src] = { ...units[e.src], x: e.to?.x ?? units[e.src].x, y: e.to?.y ?? units[e.src].y };
+          }
+          idx += 1;
+        }
+        const done = idx >= byTime.length;
+        return done ? { on: false, t: nextT, units, idx } : { ...prev, t: nextT, units, idx };
+      });
+    }, tick);
+    return () => clearInterval(timer);
+  }, [protoSim, protoPlay.on]);
 
   async function execGameCommand(command, payload = {}) {
     if (!playerId) return { ok: false, error: '먼저 bootstrap 실행' };
@@ -2489,11 +2590,11 @@ function App() {
                       ),
                       React.createElement('div', { className: 'hint', style: { marginBottom: 6 } }, '보드(7x4): 빈칸 클릭=배치, 유닛 클릭=회수'),
                       React.createElement('div', { style: { display: 'grid', gap: 6, marginBottom: 10 } }, grid),
-                      matchReplay?.ok
-                        ? React.createElement(
-                            'div',
-                            { className: 'feed-item', style: { marginTop: 10 } },
-                            React.createElement('div', { className: 'feed-text text-glow' }, `REPLAY R${matchReplay.round}`),
+	                      matchReplay?.ok
+	                        ? React.createElement(
+	                            'div',
+	                            { className: 'feed-item', style: { marginTop: 10 } },
+	                            React.createElement('div', { className: 'feed-text text-glow' }, `REPLAY R${matchReplay.round}`),
                             React.createElement(
                               'div',
                               { className: 'hint', style: { marginTop: 6 } },
@@ -2512,13 +2613,159 @@ function App() {
                                 })
                                 .join('\\n')
                             )
-                          )
-                        : null
-                    );
-                  })()
-                )
-              )
-            ),
+	                          )
+	                        : null
+	                    );
+	                  })()
+	                )
+	              )
+	              ,
+	              React.createElement(
+	                'div',
+	                { className: 'card', style: { marginTop: 12 } },
+	                React.createElement('div', { className: 'card-title' }, 'BATTLE PROTO (4x3)'),
+	                React.createElement(
+	                  'div',
+	                  { className: 'hint', style: { marginBottom: 8 } },
+	                  '전투 재미/해석성/정체성만 검증하는 프로토. 4x6 보드(상단=적, 하단=아군). 클릭으로 배치.'
+	                ),
+	                React.createElement(
+	                  'div',
+	                  { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 } },
+	                  React.createElement('input', {
+	                    value: protoSeed,
+	                    onChange: (e) => setProtoSeed(String(e.target.value || '')),
+	                    placeholder: 'seed',
+	                    style: { flex: '1 1 160px' }
+	                  }),
+	                  React.createElement('button', { className: 'retro-btn pill secondary', onClick: () => setProtoSeed(String(Date.now())) }, 'NEW SEED'),
+	                  React.createElement('button', { className: 'retro-btn pill', disabled: protoBusy, onClick: () => protoSimulate() }, protoBusy ? 'SIM...' : 'SIMULATE'),
+	                  React.createElement('button', { className: 'retro-btn pill secondary', onClick: () => setProtoGrid(Array(24).fill(null)) }, 'CLEAR')
+	                ),
+	                React.createElement(
+	                  'div',
+	                  { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 } },
+	                  (protoRoster.length
+	                    ? protoRoster
+	                    : [
+	                        { unitId: 'xuchu', name: '허저', role: 'juggernaut' },
+	                        { unitId: 'zhangliao', name: '장료', role: 'diver' },
+	                        { unitId: 'xunyu', name: '순욱', role: 'strategist' },
+	                        { unitId: 'dianwei', name: '전위', role: 'tank' }
+	                      ]
+	                  ).map((u) =>
+	                    React.createElement(
+	                      'button',
+	                      {
+	                        key: `proto-unit-${u.unitId}`,
+	                        className: `retro-btn pill ${protoSelected === u.unitId ? '' : 'secondary'}`,
+	                        onClick: () => setProtoSelected(String(u.unitId || ''))
+	                      },
+	                      `${u.name} · ${String(u.role || '').toUpperCase()}`
+	                    )
+	                  )
+	                ),
+	                (() => {
+	                  const cellSize = 44;
+	                  const rows = [];
+	                  for (let y = 0; y < 6; y += 1) {
+	                    const row = [];
+	                    for (let x = 0; x < 4; x += 1) {
+	                      const idx = y * 4 + x;
+	                      const unitId = protoGrid[idx];
+	                      const isEnemy = y < 3;
+	                      const label = unitId ? String(unitId).slice(0, 2).toUpperCase() : '';
+	                      row.push(
+	                        React.createElement(
+	                          'button',
+	                          {
+	                            key: `proto-cell-${idx}`,
+	                            className: 'btn-soft',
+	                            onClick: () => {
+	                              if (unitId) protoSetCell(idx, null);
+	                              else protoSetCell(idx, protoSelected);
+	                            },
+	                            title: unitId ? `REMOVE ${unitId}` : `PLACE ${protoSelected}`,
+	                            style: {
+	                              width: cellSize,
+	                              height: cellSize,
+	                              borderRadius: 10,
+	                              border: '1px solid rgba(143,255,205,0.16)',
+	                              background: unitId
+	                                ? isEnemy
+	                                  ? 'rgba(255,90,90,0.10)'
+	                                  : 'rgba(54,243,177,0.10)'
+	                                : 'rgba(0,0,0,0.12)',
+	                              color: 'rgba(231,255,242,0.92)',
+	                              fontFamily: 'VT323, ui-monospace, monospace',
+	                              fontSize: 16
+	                            }
+	                          },
+	                          label || '·'
+	                        )
+	                      );
+	                    }
+	                    rows.push(React.createElement('div', { key: `proto-row-${y}`, style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6 } }, row));
+	                  }
+	                  return React.createElement('div', { style: { display: 'grid', gap: 6, justifyContent: 'start', marginBottom: 10 } }, rows);
+	                })(),
+	                protoSim
+	                  ? protoSim.ok
+	                    ? React.createElement(
+	                        'div',
+	                        { className: 'feed-item', style: { marginBottom: 10 } },
+	                        React.createElement(
+	                          'div',
+	                          { className: 'feed-text text-glow' },
+	                          `WINNER: SEAT ${protoSim.analysis?.winnerSeat ?? protoSim.summary?.winnerSeat ?? '-'}`
+	                        ),
+	                        React.createElement('div', { className: 'hint', style: { marginTop: 6 } }, protoSim.analysis?.reason || ''),
+	                        React.createElement('div', { className: 'hint', style: { marginTop: 6 } }, (protoSim.analysis?.reasons || []).join(' · ')),
+	                        React.createElement(
+	                          'div',
+	                          { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' } },
+	                          React.createElement(
+	                            'button',
+	                            {
+	                              className: 'retro-btn pill secondary',
+	                              disabled: protoPlay.on || !(protoSim.initial && protoSim.timeline),
+	                              onClick: () => {
+	                                const units = {};
+	                                (protoSim.initial || []).forEach((u) => {
+	                                  units[u.id] = { ...u, hp: u.hpMax };
+	                                });
+	                                setProtoPlay({ on: true, t: 0, units, idx: 0 });
+	                              }
+	                            },
+	                            protoPlay.on ? 'PLAYING...' : 'PLAY'
+	                          ),
+	                          React.createElement('div', { className: 'hint', style: { alignSelf: 'center' } }, protoPlay.on ? `t=${protoPlay.t}ms` : '')
+	                        )
+	                      )
+	                    : React.createElement('div', { className: 'hint' }, `오류: ${protoSim.error || 'unknown'}`)
+	                  : null,
+	                protoSim && protoSim.ok && Array.isArray(protoSim.timeline)
+	                  ? React.createElement(
+	                      'div',
+	                      { className: 'feed-item' },
+	                      React.createElement('div', { className: 'feed-text text-glow' }, 'EVENTS'),
+	                      React.createElement(
+	                        'pre',
+	                        { style: { whiteSpace: 'pre-wrap', fontSize: 14, marginTop: 8 } },
+	                        protoSim.timeline
+	                          .slice(0, 160)
+	                          .map(
+	                            (e) =>
+	                              `${String(e.t).padStart(5)}ms ${e.type}${e.skill ? `(${e.skill})` : ''} ${e.src || ''}${e.dst ? ` -> ${e.dst}` : ''}${
+	                                e.amount != null ? ` dmg=${e.amount}` : ''
+	                              }`
+	                          )
+	                          .join('\\n')
+	                      )
+	                    )
+	                  : null
+	              )
+	            ),
             React.createElement(
               'div',
               { className: 'pane play-center' },

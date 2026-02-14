@@ -44,6 +44,7 @@ import {
   renderBattleMap,
   tryMove
 } from './battleEngine.js';
+import { PROTO_ROSTER_4X3, simulateProtoBattle4x3 } from './protoAutobattle4x3.js';
 
 const app = express();
 // Avoid 304/empty-body responses for JSON API fetch() calls (ETag caching breaks r.json()).
@@ -6074,6 +6075,26 @@ function simulateAutobattleRound({ matchId, matchSeed, round, p1, p2 }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Auto-battler MVP (1v1, 7x4) endpoints (dev-grade: create + state)
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Proto Battle (4x3) endpoints (stateless) - for early fun/good-read tests.
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/proto/battle/roster', (req, res) => {
+  res.json({ ok: true, roster: PROTO_ROSTER_4X3 });
+});
+
+app.post('/api/proto/battle/simulate', (req, res) => {
+  try {
+    const seed = String(req.body?.seed || '').trim() || String(Date.now());
+    const p1Units = Array.isArray(req.body?.p1Units) ? req.body.p1Units : [];
+    const p2Units = Array.isArray(req.body?.p2Units) ? req.body.p2Units : [];
+    const sim = simulateProtoBattle4x3({ seed, p1Units, p2Units });
+    res.json({ ok: true, ...sim });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });
+  }
+});
 
 app.post('/api/match/create', async (req, res) => {
   try {
