@@ -6089,7 +6089,8 @@ app.post('/api/proto/battle/simulate', (req, res) => {
     const seed = String(req.body?.seed || '').trim() || String(Date.now());
     const p1Units = Array.isArray(req.body?.p1Units) ? req.body.p1Units : [];
     const p2Units = Array.isArray(req.body?.p2Units) ? req.body.p2Units : [];
-    const sim = simulateProtoBattle4x3({ seed, p1Units, p2Units });
+    const seatMods = req.body?.seatMods && typeof req.body.seatMods === 'object' ? req.body.seatMods : {};
+    const sim = simulateProtoBattle4x3({ seed, p1Units, p2Units, seatMods });
     res.json({ ok: true, ...sim });
   } catch (err) {
     res.status(400).json({ ok: false, error: err?.message ? String(err.message) : String(err) });

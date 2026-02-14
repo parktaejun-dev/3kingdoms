@@ -265,7 +265,7 @@ function App() {
     try {
       const qs = new URLSearchParams(window.location.search);
       const m = String(qs.get('mode') || '').trim();
-      if (m === 'ui' || m === 'terminal' || m === 'dashboard') {
+      if (m === 'ui' || m === 'terminal' || m === 'dashboard' || m === 'vn') {
         safeLocalStorageSet('uiMode', m);
         return m;
       }
@@ -294,6 +294,13 @@ function App() {
   const [protoSim, setProtoSim] = React.useState(null);
   const [protoBusy, setProtoBusy] = React.useState(false);
   const [protoPlay, setProtoPlay] = React.useState({ on: false, t: 0, units: {}, idx: 0 });
+  const [vnState, setVnState] = React.useState(() => ({
+    step: 'pick', // pick | scene1 | battle | result
+    hero: 'xuchu',
+    // Applied as seatMods in proto simulate
+    seatMods: { seat1: {}, seat2: {} },
+    lastSim: null
+  }));
 
   const [me, setMe] = React.useState(null);
   const [party, setParty] = React.useState({ count: 0 });
@@ -415,6 +422,192 @@ function App() {
       setProtoBusy(false);
     }
   }
+
+  async function vnSimulateBattle() {
+    const seed = String(Date.now());
+    // Simple fixed formations for MVP VN loop.
+    const hero = String(vnState.hero || 'xuchu');
+    const p1Units = [{ unitId: hero, x: 1, y: 2 }, { unitId: 'xunyu', x: 2, y: 2 }]; // hero + strategist
+    const p2Units = [{ unitId: 'dianwei', x: 1, y: 0 }, { unitId: 'zhangliao', x: 2, y: 0 }]; // tank + diver
+    try {
+      const resp = await fetch('/api/proto/battle/simulate', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ seed, p1Units, p2Units, seatMods: vnState.seatMods }),
+        cache: 'no-store'
+      });
+      const data = await resp.json().catch(() => null);
+      setVnState((prev) => ({ ...prev, lastSim: data, step: 'result' }));
+    } catch (err) {
+      setVnState((prev) => ({ ...prev, lastSim: { ok: false, error: err?.message ? String(err.message) : String(err) }, step: 'result' }));
+    }
+  }
+
+  function renderVn() {
+    const hero = String(vnState.hero || 'xuchu');
+    const roster = protoRoster.length
+      ? protoRoster
+      : [
+          { unitId: 'xuchu', name: '허저', role: 'juggernaut' },
+          { unitId: 'zhangliao', name: '장료', role: 'diver' },
+          { unitId: 'xunyu', name: '순욱', role: 'strategist' },
+          { unitId: 'dianwei', name: '전위', role: 'tank' }
+        ];
+    const heroObj = roster.find((u) => String(u.unitId) === hero) || roster[0];
+
+    const topBar = React.createElement(
+      'div',
+      { className: 'vn-top' },
+      React.createElement('div', { className: 'vn-brand' }, 'RED CLIFF TERMINAL'),
+      React.createElement(
+        'div',
+        { className: 'vn-actions' },
+        React.createElement(
+          'button',
+          {
+            className: 'vn-pill',
+            onClick: () => {
+              safeLocalStorageSet('uiMode', 'ui');
+              setMode('ui');
+            }
+          },
+          'DESKTOP UI'
+        )
+      )
+    );
+
+    if (vnState.step === 'pick') {
+      return React.createElement(
+        'div',
+        { className: 'vn-root' },
+        topBar,
+        React.createElement(
+          'div',
+          { className: 'vn-stage' },
+          React.createElement('div', { className: 'vn-title' }, '장수 선택'),
+          React.createElement('div', { className: 'vn-sub' }, '관도대전(10분 런) · VN 프로토'),
+          React.createElement(
+            'div',
+            { className: 'vn-grid' },
+            roster.slice(0, 4).map((u) =>
+              React.createElement(
+                'button',
+                {
+                  key: `vn-pick-${u.unitId}`,
+                  className: `vn-card ${hero === u.unitId ? 'active' : ''}`,
+                  onClick: () => setVnState((prev) => ({ ...prev, hero: String(u.unitId) }))
+                },
+                React.createElement('div', { className: 'vn-card-title' }, u.name),
+                React.createElement('div', { className: 'vn-card-meta' }, String(u.role || '').toUpperCase()),
+                React.createElement('div', { className: 'vn-card-desc' }, u.unitId === 'xuchu' ? '전열을 부순다' : u.unitId === 'zhangliao' ? '후방을 찌른다' : u.unitId === 'xunyu' ? '전장을 설계한다' : '뒤를 지킨다')
+              )
+            )
+          ),
+          React.createElement(
+            'button',
+            { className: 'vn-cta', onClick: () => setVnState((prev) => ({ ...prev, step: 'scene1', seatMods: { seat1: {}, seat2: {} }, lastSim: null })) },
+            '시작'
+          )
+        )
+      );
+    }
+
+    if (vnState.step === 'scene1') {
+      const body =
+        '건안 5년(200년). 관도.\n조조 2만 vs 원소 10만.\n당신의 선택이 전장을 바꾼다.';
+      return React.createElement(
+        'div',
+        { className: 'vn-root' },
+        topBar,
+        React.createElement(
+          'div',
+          { className: 'vn-stage' },
+          React.createElement('div', { className: 'vn-portrait' }, React.createElement(PixelPortrait, { seedText: heroObj?.unitId || hero, size: 96, className: 'avatar avatar-pixel' })),
+          React.createElement('div', { className: 'vn-title' }, `${heroObj?.name || '장수'} · 관도대전`),
+          React.createElement('div', { className: 'vn-body' }, body),
+          React.createElement(
+            'div',
+            { className: 'vn-choices' },
+            React.createElement(
+              'button',
+              {
+                className: 'vn-choice',
+                onClick: () => setVnState((prev) => ({ ...prev, seatMods: { seat1: { defPct: 0.2 }, seat2: {} }, step: 'battle' }))
+              },
+              '방어를 굳힌다 (아군 방어 +20%)'
+            ),
+            React.createElement(
+              'button',
+              {
+                className: 'vn-choice',
+                onClick: () => setVnState((prev) => ({ ...prev, seatMods: { seat1: { atkPct: 0.15 }, seat2: {} }, step: 'battle' }))
+              },
+              '정면 돌파 (아군 공격 +15%)'
+            ),
+            React.createElement(
+              'button',
+              {
+                className: 'vn-choice',
+                onClick: () => setVnState((prev) => ({ ...prev, seatMods: { seat1: {}, seat2: { hpPct: -0.2 } }, step: 'battle' }))
+              },
+              '오소 화공 (적 체력 -20%)'
+            )
+          )
+        )
+      );
+    }
+
+    if (vnState.step === 'battle') {
+      return React.createElement(
+        'div',
+        { className: 'vn-root' },
+        topBar,
+        React.createElement(
+          'div',
+          { className: 'vn-stage' },
+          React.createElement('div', { className: 'vn-title' }, '전투'),
+          React.createElement('div', { className: 'vn-body' }, '자동전투로 검증합니다. (고정 편성)'),
+          React.createElement('div', { className: 'vn-body' }, `아군: ${heroObj?.name || hero} + 순욱  |  적군: 전위 + 장료`),
+          React.createElement(
+            'button',
+            { className: 'vn-cta', onClick: () => vnSimulateBattle() },
+            '전투 시작'
+          )
+        )
+      );
+    }
+
+    const sim = vnState.lastSim;
+    const ok = sim && sim.ok;
+    return React.createElement(
+      'div',
+      { className: 'vn-root' },
+      topBar,
+      React.createElement(
+        'div',
+        { className: 'vn-stage' },
+        React.createElement('div', { className: 'vn-title' }, ok ? `결과: SEAT ${sim.analysis?.winnerSeat ?? sim.summary?.winnerSeat ?? '-'}` : '오류'),
+        React.createElement('div', { className: 'vn-body' }, ok ? (sim.analysis?.reason || '') : String(sim?.error || 'unknown')),
+        ok ? React.createElement('div', { className: 'vn-sub' }, (sim.analysis?.reasons || []).join(' · ')) : null,
+        React.createElement(
+          'div',
+          { className: 'vn-choices' },
+          React.createElement(
+            'button',
+            { className: 'vn-choice', onClick: () => setVnState((prev) => ({ ...prev, step: 'scene1', lastSim: null })) },
+            '다른 선택 해보기'
+          ),
+          React.createElement(
+            'button',
+            { className: 'vn-choice', onClick: () => setVnState((prev) => ({ ...prev, step: 'pick', lastSim: null })) },
+            '장수 다시 선택'
+          )
+        )
+      )
+    );
+  }
+
+  if (mode === 'vn') return renderVn();
 
   React.useEffect(() => {
     if (!protoSim || !protoSim.ok || !protoPlay.on) return;

@@ -132,6 +132,11 @@ function chooseTarget(u, units) {
 }
 
 export function simulateProtoBattle4x3({ seed = '', p1Units = [], p2Units = [] }) {
+  // Optional seat modifiers: { seat1: { hpPct, atkPct, defPct }, seat2: {...} }
+  // Values are numbers like 0.15 for +15%, -0.3 for -30%.
+  // Kept minimal for Phase1 "choice -> immediate effect" validation.
+  // eslint-disable-next-line no-use-before-define
+  const seatMods = arguments[0]?.seatMods && typeof arguments[0].seatMods === 'object' ? arguments[0].seatMods : {};
   // Global battlefield is 4x6 (p1 y=0..2, p2 y=3..5).
   const W = 4;
   const H = 6;
@@ -155,6 +160,10 @@ export function simulateProtoBattle4x3({ seed = '', p1Units = [], p2Units = [] }
   function addUnit(seat, idx, u) {
     const base = rosterById(u.unitId);
     if (!base) return;
+    const mod = seat === 1 ? seatMods.seat1 : seatMods.seat2;
+    const hpPct = clamp(mod?.hpPct ?? 0, -0.8, 2.0);
+    const atkPct = clamp(mod?.atkPct ?? 0, -0.8, 2.0);
+    const defPct = clamp(mod?.defPct ?? 0, -0.8, 2.0);
     const lx = clamp(asInt(u.x, 0), 0, 3);
     const ly = clamp(asInt(u.y, 0), 0, 2);
     const gx = lx;
@@ -169,10 +178,10 @@ export function simulateProtoBattle4x3({ seed = '', p1Units = [], p2Units = [] }
       tags: base.tags,
       x: gx,
       y: gy,
-      hp: base.hp,
-      hpMax: base.hp,
-      atk: base.atk,
-      def: base.def,
+      hp: Math.max(1, Math.floor(base.hp * (1 + hpPct))),
+      hpMax: Math.max(1, Math.floor(base.hp * (1 + hpPct))),
+      atk: Math.max(1, Math.floor(base.atk * (1 + atkPct))),
+      def: Math.max(0, Math.floor(base.def * (1 + defPct))),
       aspd: base.aspd,
       range: base.range,
       cdAtk: 0,
@@ -531,7 +540,8 @@ export function simulateProtoBattle4x3({ seed = '', p1Units = [], p2Units = [] }
     firstDeathId: firstDeath ? firstDeath.src : null,
     decisiveSkill: decisive ? decisive.skill : null,
     reason,
-    reasons: reasons.slice(0, 2)
+    reasons: reasons.slice(0, 2),
+    seatMods
   };
 
   const summary = {
@@ -544,4 +554,3 @@ export function simulateProtoBattle4x3({ seed = '', p1Units = [], p2Units = [] }
 
   return { initial, timeline, summary, analysis };
 }
-
